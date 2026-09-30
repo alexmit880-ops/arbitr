@@ -1,0 +1,4 @@
+ccxt==4.2.20
+aiohttp==3.9.1
+python-dotenv==1.0.0
+loguru==0.7.2
