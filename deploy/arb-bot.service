@@ -1,6 +1,11 @@
 [Unit]
 Description=Arbitrage Cash-and-Carry Bot (paper mode)
-Documentation=file:///home/user/arbitr/deploy/README_HIVE.md
+# Раньше здесь был "Documentation=file:///home/user/arbitr/deploy/README_HIVE.md"
+# - путь жёстко указывал на /home/user, а сервис запускается от того, кто
+# выполнил systemctl. В статусе это выглядело как битая ссылка:
+#     Docs: file:///home/user/arbitr/deploy/README_HIVE.md
+# при реальном расположении /root/arbitr. Ссылка бесполезна и вводит
+# в заблуждение при разборе, поэтому убрана.
 
 # ЗАЧЕМ After=network.target, а не hive.service
 #
