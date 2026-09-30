@@ -982,9 +982,20 @@ class ReplaySystem:
             volume=opp.volume,
         ))
 
-    def record_decision(self, opp: Opportunity, action: str, reason: str = "", 
+    def record_decision(self, opp: Opportunity, action: str, reason: str = "",
                         planned_size_usdt: float = 0.0, fill_probability: float = 0.0,
-                        expected_value_usdt: float = 0.0, pnl: float = 0.0):
+                        expected_value_usdt: float = 0.0, pnl: float = 0.0,
+                        stability_score: float = 0.0, decay_rate: float = 0.0):
+        """
+        Запись решения по возможности - для реплея и последующего анализа.
+
+        ВОССТАНОВЛЕНО (Шаг 0.5, 2026-09-30): параметры stability_score и
+        decay_rate. Поля объявлены у ReplayDecision, и app.py передаёт их в
+        пяти местах, но сигнатура их не принимала. Каждый такой вызов падал:
+            TypeError: record_decision() got an unexpected keyword argument
+        То есть НИ ОДНО решение о сделке не попадало в журнал реплея, включая
+        самые частые ветки "blocked". Параметры потерялись при пересборке.
+        """
         self.decisions.append(ReplayDecision(
             timestamp=int(time.time()),
             symbol=opp.symbol,
@@ -995,6 +1006,8 @@ class ReplaySystem:
             spread_pct=opp.spread_pct,
             net_profit_pct=opp.net_profit_pct,
             max_size_usdt=opp.max_safe_size_usdt,
+            stability_score=stability_score,
+            decay_rate=decay_rate,
             planned_size_usdt=planned_size_usdt,
             fill_probability=fill_probability,
             expected_value_usdt=expected_value_usdt,
@@ -1709,7 +1722,25 @@ class PriceCache:
                 )
             new_prices = {}
             for symbol, data in all_tickers.items():
-                if "/USDT" not in symbol or ":USDT" in symbol:
+                if not data:
+                    continue
+                # ВОССТАНОВЛЕНО (Шаг 0.5, 2026-09-30).
+                #
+                # Раньше стояло:
+                #     if "/USDT" not in symbol or ":USDT" in symbol: continue
+                # то есть перпетуалы вида "BTC/USDT:USDT" ОТБРАСЫВАЛИСЬ.
+                #
+                # Проверено на живых данных: bybit futures отдаёт 896 тикеров,
+                # из них 782 перпетуала и 0 обычных спотовых. То есть фильтр
+                # отсекал 100% фьючерсных котировок, futures_prices оставался
+                # ПУСТЫМ, и стратегия spot-long / futures-short не имела
+                # второй ноги: ни одной сделки закрыться не могло.
+                #
+                # Перпетуалы и есть тот инструмент, который нужен для
+                # арбитража против спота, поэтому ":USDT" теперь норма,
+                # а не признак отбраковки. Спотовые символы (без ":USDT")
+                # на фьючерсных клиентах тоже допускаются.
+                if "/USDT" not in symbol:
                     continue
                 ticker = Ticker.from_ccxt(ex_name, symbol, data)
                 if ticker:

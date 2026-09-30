@@ -577,7 +577,80 @@ async def main():
                     continue
                 
                 exchange_health.record_success("all")
-                
+
+                # ═══════════════════════════════════════════════════════════
+                # УПРАВЛЕНИЕ ОТКРЫТЫМИ ПАРАМИ (Шаг 0.2, 2026-09-30)
+                #
+                # SpotFuturesPaperTrader НЕ закрывает ноги в execute(): он
+                # открывает пару (спот + шорт фьючерса) и держит её до
+                # сходимости базиса, стопа или таймаута. Закрытие происходит
+                # здесь, каждый цикл.
+                #
+                # До этой правки вызова не было вообще: пары открывались и
+                # жили бесконечно, PnL не считался, баланс оставался
+                # замороженным, а состояние не сохранялось.
+                #
+                # ВАЖНО про структуры словарей — они разные:
+                #   execute():  prices = {exchange: Ticker}
+                #               futures_prices = {symbol: {exchange: Ticker}}
+                #   здесь:      prices = {symbol: {exchange: Ticker}}
+                #               futures_prices = {symbol: {exchange: Ticker}}
+                # То есть prices здесь берётся из cache.prices напрямую,
+                # а не из результата cache.get_prices(symbols).
+                # ═══════════════════════════════════════════════════════════
+                if trader is not None and hasattr(trader, "manage_open_positions"):
+                    try:
+                        # Блокировка НЕ берётся: manage_open_positions()
+                        # синхронный (def, не async def) и внутри нет
+                        # await, поэтому цикл не может переключиться
+                        # посередине — гонок с другими задачами здесь нет.
+                        # Попытка взять trader.risk.lock (asyncio.Lock)
+                        # синхронным `with` падала с
+                        #   "'Lock' object does not support the context
+                        #    manager protocol",
+                        # а `async with` здесь потребовал бы await внутри
+                        # синхронного метода. Оба варианта неверны.
+                        closed_pairs = trader.manage_open_positions(
+                            prices=cache.prices,
+                            futures_prices=cache.futures_prices,
+                            cycle=cycle,
+                        )
+                        for closed in closed_pairs:
+                            await db.close_trade(
+                                closed.symbol, closed.buy_exchange,
+                                closed.sell_exchange, closed.pnl,
+                                closed.pnl_pct, closed.balance_after,
+                            )
+                            # ВАЖНО: PnL НЕ прибавляем к portfolio.balance
+                            # вручную. Это уже сделал manage_open_positions()
+                            # при расчёте сделки. А record_trade() ниже
+                            # прибавляет trade.pnl ЕЩЁ РАЗ, поэтому
+                            # дополнительное `portfolio.balance += closed.pnl`
+                            # давало двойной счёт (проверено: +0.2531 на
+                            # сделке с PnL +0.2531).
+                            trader.risk.record_trade(closed)
+                            emoji = "\U0001F7E2" if closed.pnl > 0 else "\U0001F534"
+                            dashboard.add_log(
+                                f"{emoji} CLOSED {closed.symbol} "
+                                f"{closed.buy_exchange}\u2192{closed.sell_exchange} "
+                                f"PnL: ${closed.pnl:+.4f} ({closed.pnl_pct:+.3f}%)"
+                            )
+                            logger.info(
+                                f"CLOSED {closed.symbol} "
+                                f"{closed.buy_exchange}->{closed.sell_exchange} "
+                                f"pnl={closed.pnl:+.4f} pnl_pct={closed.pnl_pct:+.3f}% "
+                                f"balance={closed.balance_after:.2f}"
+                            )
+                            if closed.pnl < 0:
+                                system_health.record_error(
+                                    f"closed loss {closed.symbol} {closed.pnl:.4f}")
+                    except Exception as e:
+                        # Ошибка управления НЕ должна ронять цикл: иначе
+                        # одна битая пара останавливает весь бот.
+                        logger.error(
+                            f"manage_open_positions failed: {e}", exc_info=True)
+                        system_health.record_error(f"manage: {str(e)[:60]}")
+
                 # Update zombie detector
                 try:
                     zombie_detector.update(prices)
@@ -834,11 +907,67 @@ async def main():
                                     futures_prices=cache.futures_prices.get(opp.symbol, {}),
                                     funding_tracker=funding_tracker,
                                 )
+
+                                # ═════════════════════════════════════════════
+                                # РАЗДЕЛЕНИЕ МОДЕЛЕЙ ИСПОЛНЕНИЯ (Шаг 0.2)
+                                #
+                                # Два трейдера с РАЗНЫМ контрактом:
+                                #
+                                #  PaperTrader (спот против спота) —
+                                #      execute() атомарен: купил и продал, вернул
+                                #      готовую TradeResult. Старый путь ниже
+                                #      остаётся без изменений.
+                                #
+                                #  SpotFuturesPaperTrader (спот + шорт фьючерса) —
+                                #      execute() ОТКРЫВАЕТ пару и возвращает None.
+                                #      Ноги держатся до сходимости базиса,
+                                #      закрываются в manage_open_positions()
+                                #      в начале следующего цикла.
+                                #
+                                # Раньше для обоих стоял один путь `if trade:`.
+                                # Для spot_futures он не срабатывал НИКОГДА
+                                # (execute отдаёт None), из-за чего:
+                                #   - открытые пары не попадали в БД;
+                                #   - при старте бот не видел своих позиций;
+                                #   - close_trade вызывался бы сразу после
+                                #     открытия, то есть на пустом месте.
+                                # ═════════════════════════════════════════════
+                                is_holding_trader = hasattr(trader, "open_pairs")
+
+                                if is_holding_trader:
+                                    # Пара могла открыться, а могла быть
+                                    # отклонена. Сверяемся с состоянием,
+                                    # а не с возвратом execute().
+                                    if (opp.symbol in trader.open_pairs
+                                            and not trader.open_pairs[opp.symbol].notes):
+                                        pair = trader.open_pairs[opp.symbol]
+                                        # Помечаем, чтобы повторно не писать
+                                        await db.save_open_trade(
+                                            opp, pair.size_usdt, opp.category)
+                                        pair.notes = "saved"
+                                        pair_ranker.record(opp, executed=True)
+                                        replay.record_decision(
+                                            opp, "executed", "opened",
+                                            planned_size_usdt=pair.size_usdt,
+                                            expected_value_usdt=0.0,
+                                        )
+                                        dashboard.add_log(
+                                            f"\U0001F4E6 OPEN {opp.symbol} "
+                                            f"{pair.buy_exchange}\u2192{pair.sell_exchange} "
+                                            f"${pair.size_usdt:.2f} basis "
+                                            f"{pair.entry_basis:+.3f}%"
+                                        )
+                                        logger.info(
+                                            f"OPEN {opp.symbol} "
+                                            f"{pair.buy_exchange}->{pair.sell_exchange} "
+                                            f"size={pair.size_usdt:.2f} "
+                                            f"basis={pair.entry_basis:+.3f}%"
+                                        )
                                 if trade and PARTIAL_FILL_ENABLED:
                                     trade = PartialFillSimulator.apply(
                                         trade, opp.max_safe_size_usdt, reality.planned_size_usdt
                                     )
-                                if trade:
+                                if trade and not is_holding_trader:
                                     # A0.3 FIX: раньше save_open_trade вызывался ДО
                                     # trader.execute() — то есть до того, как было
                                     # известно, состоится ли сделка вообще. Если
