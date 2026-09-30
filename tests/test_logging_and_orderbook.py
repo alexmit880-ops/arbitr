@@ -384,3 +384,39 @@ def test_requirements_pins_versions():
         if line and not line.startswith("#") and "==" not in line:
             unpinned.append(line)
     assert not unpinned, f"зафиксируйте версии: {unpinned}"
+
+
+# ─────────────── дашборд и не-TTY вывод ───────────────
+
+def test_dashboard_does_not_grab_screen_when_not_tty():
+    """Без TTY дашборд не рисует и не пишет escape-коды в stdout.
+
+    Шаг 1.4: было Live(..., screen=True) безусловно. При запуске через
+    run_bot.sh вывод идёт в пайп (| tee), stdout не TTY - и rich всё
+    равно рисовал, ЗАХВАТЫВАЯ экран. В терминале было пусто, создавая
+    впечатление зависания, хотя бот работал. Для journalctl это тем
+    более плохо: escape-последовательности забивают лог.
+    """
+    import inspect
+    import app
+    src = inspect.getsource(app)
+    assert "screen=_interactive" in src, "screen не зависит от TTY"
+    assert "isatty" in src, "нет проверки TTY"
+    # Голое screen=True безусловно - это и был баг
+    # Проверяем ИСПОЛНЯЕМЫЕ строки, а не весь исходник: screen=True
+    # законно упоминается в комментарии, где описана причина бага.
+    _code = "\n".join(ln for ln in src.splitlines()
+                    if not ln.strip().startswith("#"))
+    assert "screen=True" not in _code, "screen=True остался безусловным в коде"
+    assert "console=None if _interactive else False" in src, (
+        "при перенаправлении вывод должен быть отключён")
+
+
+def test_loguru_sink_writes_utf8_and_rotates():
+    """Файл лога должен открываться в UTF-8, иначе кириллица в логе
+    превращается в мусор при просмотре через less/journalctl."""
+    import inspect
+    import app
+    src = inspect.getsource(app.setup_file_logging)
+    assert 'encoding="utf-8"' in src, "лог не в UTF-8"
+    assert "rotation=" in src, "нет ротации"

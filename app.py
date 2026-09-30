@@ -723,7 +723,23 @@ async def main():
     zombie_since: Dict[str, float] = {}
     last_recovery_time = 0  # NEW
     
-    with Live(dashboard.render(), refresh_per_second=2, screen=True) as live:
+    # Дашборд рисуется ТОЛЬКО при интерактивном терминале.
+    #
+    # Шаг 1.4: стояло Live(..., screen=True) безусловно. При запуске
+    # через run_bot.sh вывод идёт в пайп (| tee), то есть stdout не TTY,
+    # и rich всё равно рисует, ЗАХВАТЫВАЯ экран. В итоге в терминале
+    # было пусто - не видно ни подключения бирж, ни циклов, - и
+    # казалось, что бот завис, хотя он работал.
+    #
+    # Два требования, оба из опыта развёртывания:
+    #   - без TTY дашборд не рисуем вовсе (иначе он съедает вывод логов);
+    #   - при перенаправлении вывода в файл писать туда НЕЛЬЗЯ: там
+    #     ANSI-последовательности от rich, и journalctl/logcat забиваются
+    #     escape-кодами. Логи идут через loguru в hunter.log.
+    # Для systemd-сервиса это вообще штатный режим: stdout не TTY.
+    _interactive = sys.stdout.isatty()
+    with Live(dashboard.render(), refresh_per_second=2,
+              screen=_interactive, console=None if _interactive else False) as live:
         try:
             while not shutdown.is_set():
                 cycle += 1
