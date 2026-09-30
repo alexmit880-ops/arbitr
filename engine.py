@@ -215,15 +215,45 @@ class OrderBookExecutionAnalyzer:
     """
 
     @staticmethod
-    def _vwap(levels: list, target_usdt: float, side: str) -> Tuple[float, float]:
+    def _iter_levels(levels: list):
+        """
+        Нормализует уровни стакана к паре (цена, количество).
+
+        ЗАЧЕМ (Шаг 0.7): биржи отдают уровни в РАЗНЫХ форматах. Проверено
+        на живых данных:
+            bybit   [118.82, 202.5992]      - пара
+            mexc    [118.85, 222.431]       - пара
+            gate    [118.83, 98.096]        - пара
+            okx     [118.83, 70.436264, 0]  - тройка, третье поле = число
+                                            заявок (order count)
+
+        Раньше стояло `for price, amount in levels` - на okx это падало с
+        "too many values to unpack (expected 2)". Исключение уходило в
+        общий обработчик, из-за чего весь L2-анализ для этой биржи не
+        работал: сделка отклонялась как blocked, хотя стакан был в
+        порядке. За один прогон - 44 отказа, то есть выпадало всё, что
+        involves okx.
+
+        Третье поле игнорируется: для VWAP нужны только цена и
+        количество, число заявок на глубину не влияет.
+        """
+        for lvl in (levels or []):
+            if not isinstance(lvl, (list, tuple)) or len(lvl) < 2:
+                continue
+            try:
+                price = float(lvl[0] or 0)
+                amount = float(lvl[1] or 0)
+            except (TypeError, ValueError):
+                continue
+            if price > 0 and amount > 0:
+                yield price, amount
+
+    @classmethod
+    def _vwap(cls, levels: list, target_usdt: float, side: str) -> Tuple[float, float]:
         remaining = target_usdt
         base_qty = 0.0
         spent_usdt = 0.0
-        for price, amount in levels:
-            price = float(price or 0)
-            amount = float(amount or 0)
-            if price <= 0 or amount <= 0:
-                continue
+        for price, amount in cls._iter_levels(levels):
             level_usdt = price * amount
             take_usdt = min(remaining, level_usdt)
             base_qty += take_usdt / price
@@ -235,14 +265,11 @@ class OrderBookExecutionAnalyzer:
             return 0.0, 0.0
         return spent_usdt / base_qty, spent_usdt
 
-    @staticmethod
-    def _depth_usdt(levels: list) -> float:
+    @classmethod
+    def _depth_usdt(cls, levels: list) -> float:
         total = 0.0
-        for price, amount in levels:
-            try:
-                total += float(price or 0) * float(amount or 0)
-            except (TypeError, ValueError):
-                continue
+        for price, amount in cls._iter_levels(levels):
+            total += price * amount
         return total
 
     @classmethod
@@ -3421,6 +3448,8 @@ class Database:
         self.queue: asyncio.Queue = asyncio.Queue()
         self._writer_task: Optional[asyncio.Task] = None
         self.conn: Optional[sqlite3.Connection] = None
+        # Счётчик записей до следующей уборки opportunities (Шаг 0.8).
+        self._writes_since_cleanup = 0
     
     async def start(self):
         self._writer_task = asyncio.create_task(self._writer())
@@ -3484,16 +3513,70 @@ class Database:
                 # "duplicate column name" — колонка уже есть, это норма
                 if "duplicate column" not in str(e).lower():
                     raise
+        # РЕЖИМ ХРАНЕНИЯ (Шаг 0.8, 2026-09-30).
+        #
+        # hunter.db доросла до 343 MB, и причины две, обе здесь.
+        #
+        # 1) journal_mode=DELETE (по умолчанию) пишет откатный журнал
+        #    рядом с базой и НЕ освобождает страницы при commit - файл
+        #    только растёт. WAL вместо этого позволяет чистить старые
+        #    строки с освобождением места.
+        #
+        # 2) vacuum: даже после DELETE файл не сжимается - sqlite
+        #    помечает страницы как свободные, но не уменьшает файл.
+        #    Без VACUUM место не вернётся никогда.
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        # CREATE INDEX IF NOT EXISTS - тоже идемпотентно, индекс нужен,
+        # чтобы DELETE по ts шёл по индексу, а не сканировал 2.5 млн строк.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_opportunities_ts ON opportunities(ts)")
         self.conn.commit()
         while True:
             try:
                 query, args = await self.queue.get()
                 self.conn.execute(query, args)
                 self.conn.commit()
+                # Периодическая уборка таблицы opportunities (Шаг 0.8).
+                # app.py пишет ВСЕ найденные возможности каждый цикл
+                # (800 символов -> тысячи строк за цикл), и без уборки
+                # база росла на ~10 МБ в сутки и дошла до 343 МБ / 2.5 млн
+                # строк. Таблица нигде не читается - единственный запрос
+                # к ней это INSERT, - так что старые строки никому не
+                # нужны. Храним только последние сутки для разбора.
+                self._writes_since_cleanup += 1
+                if self._writes_since_cleanup >= DB_CLEANUP_EVERY_WRITES:
+                    self._writes_since_cleanup = 0
+                    await self._cleanup_old_opportunities()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.warning(f"DB: {e}")
+
+    async def _cleanup_old_opportunities(self):
+        """Удалить возможности старше DB_OPPORTUNITIES_KEEP_SEC. Затем VACUUM.
+
+        VACUUM нужен отдельным шагом и именно здесь: DELETE в sqlite
+        лишь помечает страницы свободными, размер файла не меняется.
+        Место возвращает только VACUUM.
+        """
+        try:
+            cutoff = int(time.time()) - DB_OPPORTUNITIES_KEEP_SEC
+            cur = self.conn.execute(
+                "DELETE FROM opportunities WHERE ts < ?", (cutoff,))
+            deleted = cur.rowcount or 0
+            self.conn.commit()
+            if deleted:
+                logger.info(
+                    f"🗄️ opportunities: удалено {deleted} записей старше "
+                    f"{DB_OPPORTUNITIES_KEEP_SEC // 3600}ч")
+            # WAL_checkpoint(TRUNCATE) - сбрасывает и обрезает -wal файл,
+            # который иначе растёт рядом с базой до размера самой базы.
+            self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self.conn.execute("VACUUM")
+            logger.info("🗄️ VACUUM выполнен, база сжата")
+        except Exception as e:
+            logger.warning(f"DB cleanup: {e}")
     
     async def save_opportunity(self, opp: Opportunity):
         await self.queue.put((

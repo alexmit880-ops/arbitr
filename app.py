@@ -29,6 +29,141 @@ from engine import (
 )
 
 
+# ─────────────────────────────── ЛОГИРОВАНИЕ ───────────────────────────────
+# ЗАЧЕМ ЭТОТ БЛОК. Факт, который стоило измерить, а не угадать: в старом
+# hunter.log на 175 921 строку 154 544 (87.8%) занимали сообщения зомби-
+# детектора об одной и той же паре, а сам детектор не давал ничего,
+# кроме повторов. Ротация стояла на 50 MB / 7 дней, поэтому один
+# сбойный участок кода мог за сутки выесть весь лимит.
+#
+# Что здесь сделано (три независимых рычага):
+#   1. Ротация 25 MB / 3 дня вместо 50 MB / 7 дней — суточный объём
+#      падает в 4 раза по верхней границе.
+#   2. Фильтр-антиповтор (RepeatFilter): одинаковые сообщения подряд
+#      схлопываются в одну строку со счётчиком. Информация не теряется —
+#      видно, что событие было и сколько раз; исчезает только объём.
+#      Именно это и убивало диск: не сами события, а их повторы.
+#   3. Уровень по умолчанию INFO, в stderr идёт только WARNING+ — при
+#      перенаправлении вывода в файл это ещё один источник дублей.
+#
+# Важно: антиповтор НЕ трогает построчный diff и не режет разные
+# сообщения — сравнение идёт по шаблону, из которого выброшены числа
+# и таймстемпы. Два разных символа с разными ценами останутся двумя
+# разными строками.
+
+LOG_MAX_MB = 25
+LOG_KEEP_DAYS = 3
+LOG_TEMPLATE = "{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} - {message}"
+
+# Сколько секунд не повторять тот же шаблон. 60 = не чаще раза в минуту:
+# счётчик всё равно покажет реальную частоту, а файл не растёт.
+REPEAT_WINDOW_SEC = 60
+
+
+def _message_template(record) -> str:
+    """Шаблон сообщения без чисел — по нему считаем повторы.
+
+    Числа выкидываем намеренно: иначе "SOL/USDT conf=83" и "SOL/USDT
+    conf=84" считались бы разными сообщениями, и подавление не
+    срабатывало бы ровно в том случае, когда оно нужнее всего.
+    """
+    text = record["message"]
+    out = []
+    prev_digit = False
+    for ch in text:
+        if ch.isdigit():
+            if not prev_digit:
+                out.append("#")
+            prev_digit = True
+        else:
+            prev_digit = False
+            out.append(ch)
+    return "".join(out)[:160]
+
+
+class RepeatFilter:
+    """loguru-фильтр: пропускает сообщение и суммирует подавленные.
+
+    Первое сообщение шаблона проходит как есть. Следующие в пределах
+    REPEAT_WINDOW_SEC молча отбрасываются и копятся в _pending. Когда
+    шаблон встречается снова (после истечения окна), накопленный счётчик
+    дописывается к этой строке — видно и событие, и его частоту.
+
+    Сознательно НЕ вызываем logger изнутри фильтра: это рекурсия (снова
+    через фильтр) и пустые строки в логе. Итоги по всем шаблонам
+    выгружаются один раз при остановке, методом flush_summary().
+    """
+
+    def __init__(self, window_sec: int = REPEAT_WINDOW_SEC):
+        self.window = window_sec
+        self._last_seen: Dict[str, float] = {}
+        self._pending: Dict[str, int] = {}
+        self.total_suppressed = 0
+
+    def __call__(self, record) -> bool:
+        key = _message_template(record)
+        now = time.time()
+
+        if now - self._last_seen.get(key, 0.0) < self.window:
+            # Подавляем. Счётчик копится — потерянная информация о частоте
+            # не теряется, а всплывает на следующем появлении шаблона.
+            self._pending[key] = self._pending.get(key, 0) + 1
+            self.total_suppressed += 1
+            return False
+
+        n = self._pending.pop(key, 0)
+        self._last_seen[key] = now
+        if n:
+            record["message"] = (
+                f"{record['message']}\n    ↳ ещё {n} таких же сообщений "
+                f"подавлено за последние {self.window}с"
+            )
+        return True
+
+    def flush_summary(self) -> str:
+        """Итог по всем накопленным дублям. Вызывается один раз при остановке."""
+        parts = [f"{k.strip()[:70]} x{v}" for k, v in self._pending.items() if v]
+        self._pending.clear()
+        if not parts:
+            return ""
+        return (
+            f"Подавлено повторов за прогон: {self.total_suppressed} "
+            f"(всего {len(parts)} шаблонов)\n    " + "\n    ".join(parts[:20])
+        )
+
+
+_REPEAT_FILTER: Optional[RepeatFilter] = None
+
+
+def setup_file_logging() -> None:
+    """Единая точка настройки файлового лога: ротация + антиповтор.
+
+    Фильтр создаётся именно здесь, а не на верхнем уровне модуля:
+    test_entrypoint_integrity запрещает исполняемый код при импорте
+    app.py, иначе импорт запускал бы боковые эффекты.
+    """
+    global _REPEAT_FILTER
+    _REPEAT_FILTER = RepeatFilter()
+    logger.remove()
+    logger.add(
+        "logs/hunter.log",
+        rotation=f"{LOG_MAX_MB} MB",
+        retention=f"{LOG_KEEP_DAYS} days",
+        level="INFO",
+        format=LOG_TEMPLATE,
+        filter=_REPEAT_FILTER,
+        enqueue=True,
+        encoding="utf-8",
+    )
+
+
+def flush_repeat_summary() -> None:
+    """Дописать итог по подавленным повторам перед остановкой."""
+    summary = _REPEAT_FILTER.flush_summary() if _REPEAT_FILTER else ""
+    if summary:
+        logger.warning(summary)
+
+
 class Dashboard:
     def __init__(self):
         self.log_buffer: Deque[str] = deque(maxlen=LOG_PANEL_HEIGHT * 3)
@@ -418,6 +553,15 @@ async def reconnect_loop(pool, exchange_health, shutdown):
             logger.warning(f"Reconnect loop: {e}")
 
 async def main():
+    # Логирование настраиваем ПЕРВЫМ действием. Раньше setup стоял
+    # много ниже, и всё, что происходит до него (подключение бирж,
+    # прогрев кэша, восстановление состояния), писалось дефолтным
+    # sink'ом loguru в stderr на уровне DEBUG - то есть в тот файл,
+    # куда перенаправлен вывод, и совсем без ротации. Стартовые
+    # ошибки - самые ценные для разбора, и им хуже всего.
+    setup_file_logging()
+    logger.add(sys.stderr, level="WARNING")
+
     tg = Telegram()
     await tg.start()
     db = Database()
@@ -481,8 +625,9 @@ async def main():
             logger.debug(f"State restore: {e}")
     
     dashboard = Dashboard()
-    logger.remove()
-    logger.add("logs/hunter.log", rotation="50 MB", retention="7 days", level="INFO")
+    # Настройка логов уже выполнена первым действием main() - здесь
+    # ничего не перенастраиваем, иначе сообщения о подключении бирж
+    # и прогреве кэша попали бы мимо ротации.
     
     shutdown = asyncio.Event()
     def signal_handler():
@@ -701,12 +846,17 @@ async def main():
                                 zombie_alerts.append(f"{symbol}: {reason}")
                                 known_zombies.add(symbol)
                                 zombie_since[symbol] = time.time()
-                                logger.warning(f"⚰️ ZOMBIE: {symbol} - {reason}")
+                                # DEBUG, а не WARNING: на 800 символов это
+                                # сотни строк за прогон, и они уводили
+                                # 88% hunter.log. Само событие не пропало -
+                                # символ виден в панели ZOMBIES на дашборде
+                                # и в агрегате "zombies=N/M" в конце цикла.
+                                logger.debug(f"ZOMBIE: {symbol} - {reason}")
                             elif not is_zombie and symbol in known_zombies:
                                 known_zombies.discard(symbol)
                                 zombie_since.pop(symbol, None)
                                 zombie_detector.mark_recovered(symbol)
-                                logger.info(f"✅ RECOVERED: {symbol}")
+                                logger.debug(f"RECOVERED: {symbol}")
                         except Exception:
                             pass
                 
@@ -1245,7 +1395,10 @@ async def main():
             await pool.close()
             await db.stop()
             await tg.stop()
-            
+            # Итог по подавленным повторам: без него нельзя отличить
+            # "событий не было" от "событий было 4000, но они схлопнуты".
+            flush_repeat_summary()
+
             if trader:
                 try:
                     s = trader.stats()
