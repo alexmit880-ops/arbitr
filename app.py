@@ -1115,6 +1115,28 @@ async def main():
                 except Exception as e:
                     logger.debug(f"No-trade alert: {e}")
 
+                # ── ДИАГНОСТИКА БАЛАНСОВ (Шаг 0.6) ──────────────────────
+                #
+                # Сигнал, а не перевод: показываем ОТКУДА и КУДА перелить,
+                # решение принимает человек. Автоперевод в live опасен —
+                # комиссия, время заморозки и риск остаться без хеджа.
+                #
+                # Проверяется редко: дрейф медленный (мекс. биржа -0.72 USDT
+                # за сделку), а расчёт по всем биржам на каждом цикле —
+                # лишняя работа без новой информации.
+                if balance_manager and cycle % 120 == 0:
+                    try:
+                        target = PAPER_BALANCE / max(len(pool.clients), 1)
+                        signals = balance_manager.rebalance_signal(
+                            target_per_exchange=target)
+                        for s in signals:
+                            msg = (f"REBALANCE {s['from']}->{s['to']} "
+                                   f"${s['amount_usdt']:.2f} [{s['urgency']}]")
+                            logger.warning(f"{msg}: {s['reason']}")
+                            dashboard.add_log(f"⚖️ {msg}")
+                    except Exception as e:
+                        logger.debug(f"Rebalance check: {e}")
+
                 try:
                     exchange_health.log_warnings(logger)
                     trader_stats = trader.stats() if trader else {}

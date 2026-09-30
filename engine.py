@@ -690,6 +690,92 @@ class BalanceManager:
         if reserved_usdt > 0:
             self.release(exchange, "USDT", reserved_usdt)
 
+    def rebalance_signal(self, target_per_exchange: Optional[float] = None,
+                         min_amount: float = 10.0,
+                         trigger_ratio: float = 0.5) -> List[dict]:
+        """
+        ДИАГНОСТИЧЕСКИЙ сигнал: куда переводить, чтобы восстановить баланс.
+
+        НЕ выполняет перевод. В paper-режиме двигать нечего, а в live
+        автоматический перевод без участия человека опасен: комиссия,
+        время заморозки и риск, что в момент перевода позиция окажется
+        не хеджированной. Задача этого метода - показать ОТКУДА и КУДА,
+        решение принимает человек.
+
+        Почему балансы расходятся (измерено, Шаг 0.5):
+        дрейф СТРУКТУРНЫЙ, а не случайный. При входе в пару спотовая нога
+        теряет на спреде и проскальзывании (покупка по ask, продажа по
+        bid), а фьючерсная забирает всю прибыль от сходимости базиса
+        (шорт приносит ровно то, что съела спотовая нога, плюс базис).
+        Итог: USDT всегда мигрирует В СТОРОНУ биржи шорта.
+        Замерено: mexc -0.72 USDT за сделку, bybit +4.10 за сделку.
+
+        Логика сигнала:
+          * дефицитная биржа - та, где free < target * trigger_ratio
+          * донор - биржа с максимальным избытком (free - target)
+          * сумма - min(дефицит, избыток), но не свободные деньги донора
+            (часть может быть в резерве под открытые позиции)
+          * переводы меньше min_amount не сигналим: комиссия и время
+            заморозки съедят больше самой суммы
+
+        Возвращает список dict: from, to, amount_usdt, reason, urgency.
+        """
+        balances = {ex: self.free(ex, "USDT")
+                    for ex in sorted(self.balances.keys())}
+        if not balances:
+            return []
+        if target_per_exchange is None:
+            target_per_exchange = sum(balances.values()) / len(balances)
+
+        # дефицитные: не хватает до порога
+        deficits = []
+        for ex, free in balances.items():
+            need = target_per_exchange * trigger_ratio - free
+            if need > min_amount:
+                deficits.append((ex, need))
+        if not deficits:
+            return []
+
+        # доноры: избыток сверх цели
+        donors = []
+        for ex, free in balances.items():
+            surplus = free - target_per_exchange
+            if surplus > min_amount:
+                donors.append([ex, surplus])
+        if not donors:
+            return []
+
+        signals = []
+        for need_ex, need_amt in sorted(deficits, key=lambda x: -x[1]):
+            for d in donors:
+                if d[1] <= min_amount:
+                    continue
+                amount = min(need_amt, d[1])
+                if amount < min_amount:
+                    continue
+                # нельзя отдать больше, чем реально свободно
+                amount = min(amount, balances[d[0]])
+                if amount < min_amount:
+                    continue
+                short_ratio = balances[need_ex] / target_per_exchange
+                signals.append({
+                    "from": d[0],
+                    "to": need_ex,
+                    "amount_usdt": round(amount, 2),
+                    "reason": (f"{need_ex} держит {balances[need_ex]:.0f} USDT "
+                               f"при цели {target_per_exchange:.0f} "
+                               f"({short_ratio*100:.0f}% от нормы)"),
+                    # четверть от нормы - уже критично; граница включительная,
+                    # потому что ровно 25% означает "осталась четверть
+                    # ёмкости", а не "ещё есть запас"
+                    "urgency": "critical" if short_ratio <= 0.25 else "warning",
+                })
+                d[1] -= amount
+                need_amt -= amount
+                if need_amt <= min_amount:
+                    break
+        return signals
+
     def snapshot(self) -> Dict[str, Dict[str, Dict[str, float]]]:
         return {
             exchange: {
