@@ -408,8 +408,10 @@ def test_dashboard_does_not_grab_screen_when_not_tty():
     _code = "\n".join(ln for ln in src.splitlines()
                     if not ln.strip().startswith("#"))
     assert "screen=True" not in _code, "screen=True остался безусловным в коде"
-    assert "console=None if _interactive else False" in src, (
-        "при перенаправлении вывод должен быть отключён")
+    # console задавать НЕ нужно: screen=False достаточно, чтобы rich
+    # ничего не рисовал. А вот console=False - ошибка типов (bool вместо
+    # Console), которая роняет live.update(). Это проверяет отдельный
+    # тест test_no_boolean_console_argument.
 
 
 def test_loguru_sink_writes_utf8_and_rotates():
@@ -420,3 +422,63 @@ def test_loguru_sink_writes_utf8_and_rotates():
     src = inspect.getsource(app.setup_file_logging)
     assert 'encoding="utf-8"' in src, "лог не в UTF-8"
     assert "rotation=" in src, "нет ротации"
+
+
+# ──────── падение бота не теряет причину (Шаг 1.5) ────────
+
+def test_crashes_are_logged_with_traceback():
+    """Падение верхнего уровня обязано попасть в hunter.log.
+
+    Шаг 1.5: __main__ ловил только KeyboardInterrupt, поэтому любое
+    другое исключение уходило в stderr Python-трейсбеком. На риге это
+    давало 40 строк "Unclosed client session" - шум сборки мусора
+    УМИРАЮЩЕГО процесса, - и настоящая причина падения в этом шуме
+    терялась. Разобрать падение было нечем.
+    """
+    import inspect
+    import app
+    src = inspect.getsource(app)
+    assert "Бот упал" in src, "нет записи о падении"
+    assert "format_exc" in src, "нет трейсбека"
+    # Код выхода обязан быть ненулевым при падении, иначе systemd
+    # с Restart=always решит, что это успех (см. Шаг 1.1).
+    assert "sys.exit(_exit)" in src, "нет явного кода выхода"
+    assert "_exit = 1" in src, "падение не даёт ненулевой код"
+
+
+def test_log_buffer_is_flushed_before_exit():
+    """logger.complete() обязателен: enqueue=True буферизует записи.
+
+    Без него при аварийном выходе очередь не успевает дописаться, и
+    трейсбек - ровно та строка, ради которой мы его пишем, - теряется.
+    Проверено экспериментально: без complete() в логе ничего не было.
+    """
+    import inspect
+    import app
+    src = inspect.getsource(app)
+    assert "logger.complete()" in src, "буфер логгера не сбрасывается"
+    assert "enqueue=True" in inspect.getsource(app.setup_file_logging), (
+        "если enqueue снят - complete() не обязателен, но проверь "
+        "намерение: в комментарии должно быть сказано почему")
+
+
+def test_no_boolean_console_argument():
+    """console=bool - ошибка типов, которая роняет весь бот.
+
+    Шаг 1.4 -> 1.5: стояло console=None if _interactive else False.
+    rich ждёт объект Console, а получал bool, и следом
+    live.update() падал с
+        AttributeError: 'bool' object has no attribute 'set_live'
+    То есть ломалось ВСЁ, а не только рисование дашборда. На риге это
+    выглядело как падение через 42 секунды после подключения бирж.
+    """
+    import inspect
+    import app
+    src = inspect.getsource(app)
+    _code = "\n".join(ln for ln in src.splitlines()
+                      if not ln.strip().startswith("#"))
+    assert "console=False" not in _code, (
+        "console=False - bool вместо Console, бот падает с set_live")
+    assert "else False" not in _code, "console получает bool"
+    # screen всё ещё должен зависеть от TTY (это было полезное изменение)
+    assert "screen=_interactive" in _code, "screen должен зависеть от TTY"

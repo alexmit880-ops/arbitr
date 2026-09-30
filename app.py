@@ -738,8 +738,19 @@ async def main():
     #     escape-кодами. Логи идут через loguru в hunter.log.
     # Для systemd-сервиса это вообще штатный режим: stdout не TTY.
     _interactive = sys.stdout.isatty()
+    # console=None, когда НЕ интерактивно: rich сам создаст Console
+    # по умолчанию. Раньше стояло console=False, и это была ошибка:
+    # rich ждёт объект Console, а получает bool. Дальше live.update()
+    # падал с
+    #     AttributeError: 'bool' object has no attribute 'set_live'
+    # то есть падало ВСЁ, а не только рисование. Проверено: этот трейсбек
+    # находится только потому, что Шаг 1.5 добавил его в лог.
+    #
+    # Итог: screen=False достаточно, чтобы дашборд не захватывал экран;
+    # console трогать не нужно - при перенаправлении он всё равно пишет
+    # не в tty, и жирного вывода в stdout не будет.
     with Live(dashboard.render(), refresh_per_second=2,
-              screen=_interactive, console=None if _interactive else False) as live:
+              screen=_interactive) as live:
         try:
             while not shutdown.is_set():
                 cycle += 1
@@ -1434,7 +1445,53 @@ async def main():
 
 
 if __name__ == "__main__":
+    # Шаг 1.5: раньше здесь стоял только "except KeyboardInterrupt: pass",
+    # и ЛЮБОЕ другое исключение поднималось наружу и печаталось
+    # Python-трейсбеком в stderr. На риге это давало 40 строк
+    # "Unclosed client session"/"requires to release all resources" -
+    # шум сборки мусора УМИРАЮЩЕГО процесса, а настоящая причина
+    # падения в этом шуме терялась.
+    #
+    # Теперь: трейсбек пишется в лог целиком (exc_info=True) и
+    # сохраняется ненулевой код выхода - иначе systemd счёл бы падение
+    # успешным завершением. Раньше при исключении код был 1
+    # (интерпретатор так и делает), но полагаться на это нельзя:
+    # поведение зависит от того, поймал ли кто-то исключение выше.
+    import traceback as _tb
+
+    _exit = 0
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
+        # Штатная остановка: SIGINT/Ctrl+C. Код 0, чтобы systemd при
+        # Restart=always не поднял сервис после ручной остановки.
         pass
+    except SystemExit:
+        raise
+    except BaseException as _e:      # noqa: BLE001 - нужен полныйcatch
+        # Сюда попадает и asyncio.CancelledError, и любой баг. Печатаем
+        # в stderr (его видно в терминале и в journalctl) И пишем в
+        # лог с трейсбеком - раньше в hunter.log причины не было.
+        _tb_text = _tb.format_exc()
+        sys.stderr.write(_tb_text + "\n")
+        sys.stderr.flush()
+        try:
+            logger.error(f"💥 Бот упал: {type(_e).__name__}: {_e}\n{_tb_text}")
+            # ОБЯЗАТЕЛЬНО. В setup_file_logging() стоит enqueue=True:
+            # записи уходят в фоновом потоке-воркере. При аварийном
+            # выходе очередь не успевает дописаться, и трейсбек -
+            # ровно та строка, ради которой мы его пишем, - ТЕРЯЛАСЬ.
+            # Проверено: без complete() в hunter.log ничего не было,
+            # с complete() запись появляется. logger.complete() ждёт
+            # слива буфера и закрывает файл.
+            logger.complete()
+        except Exception:
+            pass       # логирование не должно прятать исходную ошибку
+        _exit = 1
+    # Штатное завершение тоже должно дописать буфер, иначе последние
+    # секунды логов (в том числе FINAL-итог) теряются при restart=always.
+    try:
+        logger.complete()
+    except Exception:
+        pass
+    sys.exit(_exit)
