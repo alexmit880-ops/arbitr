@@ -3231,22 +3231,68 @@ class SpotFuturesPaperTrader(PaperTrader):
         return [_dc.asdict(p) for p in self.open_pairs.values()]
 
     def restore_open(self, rows: List[dict]) -> int:
-        """Восстановление открытых пар из снимка. Возвращает число принятых."""
+        """
+        Восстановление открытых пар из записей БД.
+
+        Шаг 0.7: раньше метод молча возвращал 0 - поля из БД не совпадали
+        с полями OpenPair. Database.get_open_trades() отдаёт:
+            buy_ex / sell_ex / buy_price / sell_price
+        а OpenPair ожидает:
+            buy_exchange / sell_exchange / entry_spot / entry_fut
+        Ни одно имя не совпадало, поэтому пара падала с TypeError, ошибка
+        ловилась и возвращалось 0. То есть открытые пары после
+        перезапуска терялись МОЛЧА.
+
+        Здесь имена приводятся к полям OpenPair явно. Рассчитываем amount из
+        цены входа и size_usdt, иначе позиция восстановится с нулевым
+        размером и не закроется.
+        """
         if not rows:
             return 0
         n = 0
         for r in rows:
             try:
+                sym = r.get("symbol")
+                if not sym:
+                    continue
+                entry_spot = float(r.get("entry_spot") or r.get("buy_price") or 0)
+                entry_fut = float(r.get("entry_fut") or r.get("sell_price") or 0)
+                size = float(r.get("size_usdt") or 0)
+                if entry_spot <= 0 or entry_fut <= 0 or size <= 0:
+                    logger.error(
+                        f"restore_open: {sym} - неполная запись "
+                        f"(spot={entry_spot} fut={entry_fut} size={size}), пропуск")
+                    continue
+                amount = size / entry_spot
+                basis = (entry_fut - entry_spot) / entry_spot * 100.0
                 known = {f.name for f in _dc.fields(OpenPair)}
-                self.open_pairs[r["symbol"]] = OpenPair(
-                    **{k: v for k, v in r.items() if k in known})
+                payload = {
+                    "symbol": sym,
+                    "buy_exchange": r.get("buy_exchange") or r.get("buy_ex"),
+                    "sell_exchange": r.get("sell_exchange") or r.get("sell_ex"),
+                    "direction": "fut_premium" if basis > 0 else "fut_discount",
+                    "amount": amount,
+                    "size_usdt": size,
+                    "entry_spot": entry_spot,
+                    "entry_fut": entry_fut,
+                    "entry_basis": basis,
+                    "opened_at": float(r.get("opened_at")
+                                       or r.get("ts") or time.time()),
+                    "margin": size,
+                    "hold_hours": float(r.get("hold_hours")
+                                        or PAPER_HOLD_HOURS_MAX),
+                }
+                self.open_pairs[sym] = OpenPair(
+                    **{k: v for k, v in payload.items() if k in known})
                 n += 1
             except Exception as e:
                 logger.error(f"restore_open: {r.get('symbol')} — {e}")
         if n:
             logger.warning(
-                f"ВОССТАНОВЛЕНО {n} открытых арбитражных пар. До сверки "
-                f"с биржей не открывать новые позиции по этим символам.")
+                f"ВОССТАНОВЛЕНО {n} открытых арбитражных пар. Их таймауты "
+                f"считаются от момента открытия, а не от рестарта, поэтому "
+                f"пара, открытая более {PAPER_HOLD_HOURS_MAX}ч назад, закроется "
+                f"на первом же цикле.")
         return n
 
     def _opp_stub(self, p: OpenPair) -> "Opportunity":

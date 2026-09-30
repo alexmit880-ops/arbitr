@@ -521,20 +521,32 @@ async def main():
     logger.info(f"🎯 Hunter targets: {len(symbols)}")
     await tg.send(f"🎯 v10.2 started | Auto-Recovery | {len(symbols)} targets")
     
-    # Проверка orphan-сделок после предыдущего запуска
+    # Восстановление ОТКРЫТЫХ ПАР после перезапуска (Шаг 0.7).
+    #
+    # Раньше открытые пары только ЛОГИРОВАЛИСЬ как "orphan" и терялись.
+    # Для 24-часового прогона на сервере это критично: любой перезапуск
+    # (деплой, OOM, перезагрузка) оставлял позиции без управления — они
+    # не закрывались никогда, а балансы оставались замороженными.
+    #
+    # Важно: сначала сверяем с БД, а не доверяем слепку. Пара могла быть
+    # закрыта вручную, пока бот лежал.
     try:
         open_trades = await db.get_open_trades()
         if open_trades:
-            for ot in open_trades:
+            if trader is not None and hasattr(trader, "restore_open"):
+                restored = trader.restore_open(open_trades)
                 logger.warning(
-                    f"⚠️ ORPHAN TRADE on startup: {ot['symbol']} "
-                    f"{ot['buy_ex']}→{ot['sell_ex']} ${ot['size_usdt']:.0f}"
-                )
-            dashboard.add_log(
-                f"⚠️ {len(open_trades)} orphan trades from previous run"
-            )
+                    f"♻️ ВОССТАНОВЛЕНО {restored}/{len(open_trades)} пар "
+                    f"из предыдущего запуска")
+                dashboard.add_log(
+                    f"♻️ восстановлено пар: {restored}")
+            else:
+                for ot in open_trades:
+                    logger.warning(
+                        f"⚠️ ORPHAN TRADE on startup: {ot['symbol']} "
+                        f"{ot['buy_ex']}→{ot['sell_ex']} ${ot['size_usdt']:.0f}")
     except Exception as e:
-        logger.debug(f"Startup orphan check: {e}")
+        logger.debug(f"Startup restore: {e}")
     
     # Initial funding rate fetch
     try:
