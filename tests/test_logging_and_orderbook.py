@@ -597,3 +597,128 @@ def test_config_creates_logs_before_logging_starts():
         "записи в logs/ не попадут в hunter.log и будут видны только "
         "в stderr. Это ровно тот случай, из-за которого падение на риге "
         "выглядело как тишина.")
+
+
+# ──────── скрипт запуска переживает отсутствие HOME (Шаг 1.9) ────────
+
+def test_run_script_has_no_unbound_variable_risks():
+    """Ни одна переменная не должна читаться без ":-" при set -u.
+
+    Шаг 1.9: на риге под systemd скрипт падал с
+        run_bot.sh: line 46: HOME: unbound variable
+    systemd НЕ задаёт HOME, если у сервиса нет User=/Environment=.
+    В интерактивном терминале HOME всегда есть, поэтому ошибка
+    проявлялась ТОЛЬКО под сервисом - там, где её нельзя отладить
+    обычным запуском скрипта руками.
+
+    Конкретно $HOME: $1 я закрыл ещё в Шаге 1.2, а $HOME пропустил -
+    и повторил ту же ошибку ровно в том же месте.
+    """
+    import os
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    lines = open(os.path.join(root, "deploy", "run_bot.sh"),
+                 encoding="utf-8").read().splitlines()
+    # Переменные, объявленные через local= или присвоенные выше, безопасны
+    assigned = set()
+    unsafe = []
+    for i, line in enumerate(lines, 1):
+        # local объявления ВСЕ сразу, а не только первое: строка вида
+        #   local cand script_dir home="${HOME:-}"
+        # объявляет три переменные сразу, и разбор по одному имени
+        # давал ложное срабатывание на $home.
+        for nm in re.findall(r"local\s+([^;]+)", line):
+            for part in nm.replace("=", " ").split():
+                if re.match(r"^\w+$", part):
+                    assigned.add(part)
+        m = re.match(r"\s*(\w+)=\S", line)
+        if m:
+            assigned.add(m.group(1))
+        if line.lstrip().startswith("#"):
+            continue
+        for var in re.findall(r"\$(?!\{)(\w+)", line):
+            if var in ("0", "1", "2", "SECONDS", "PIPESTATUS", "BASH_SOURCE",
+                       "RANDOM", "LINENO", "FUNCNAME", "SEC", "PPID", "IFS",
+                       "PATH", "EUID", "UID", "HOSTNAME", "PWD"):
+                continue        # всегда заданы самим bash
+            if var in assigned:
+                continue
+            unsafe.append((i, var, line.strip()[:60]))
+    assert not unsafe, (
+        f"переменные без защиты и без присваивания: {unsafe}. "
+        f"Под systemd (где HOME не задан) это 'unbound variable'.")
+
+
+def test_home_is_guarded_explicitly():
+    """$HOME обязан читаться как ${HOME:-} - это и есть суть фикса."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "deploy", "run_bot.sh"),
+                encoding="utf-8").read()
+    _code = "\n".join(ln for ln in text.splitlines()
+                      if not ln.strip().startswith("#"))
+    assert '"$HOME/arbitr"' not in _code, (
+        "сырое $HOME/arbitr упадёт под systemd - используй ${HOME:-}")
+    assert "${HOME:-}" in _code, "нет защиты ${HOME:-}"
+
+
+def test_script_runs_without_home_env(tmp_path):
+    """Скрипт обязан запускаться с ПУСТЫМ окружением HOME.
+
+    Именно так он работает под systemd. Проверяем на настоящем bash,
+    а не только чтением исходника: ошибка "unbound variable" -
+    исполняемая, её видно лишь при запуске.
+    """
+    import os
+    import shutil
+    import subprocess
+    import re
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # Git Bash, а НЕ WSL: WSL на этой машине поднимает свой rootfs и
+ # сообщает об ошибке ДО запуска скрипта, из-за чего тест врал бы.
+    bash = None
+    for cand in (r"C:\\Program Files\\Git\\bin\\bash.exe",
+                 r"C:\\Program Files (x86)\\Git\\bin\\bash.exe",
+                 "/bin/bash", "/usr/bin/bash"):
+        if os.path.exists(cand):
+            bash = cand
+            break
+    if not bash:
+        pytest.skip("bash недоступен")
+    home = tmp_path / "home"
+    proj = home / "arbitr"
+    (proj / "venv" / "bin").mkdir(parents=True)
+    (proj / "logs").mkdir()
+    (proj / "app.py").write_text("", encoding="utf-8")
+    (proj / ".env").write_text("TRADING_MODE=paper\n", encoding="utf-8")
+    py = proj / "venv" / "bin" / "python"
+    py.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    os.chmod(py, 0o755)
+    scripts = home / "scripts"
+    scripts.mkdir()
+    shutil.copy(os.path.join(root, "deploy", "run_bot.sh"),
+                str(scripts / "run_bot.sh"))
+    env = {k: v for k, v in os.environ.items() if k != "HOME"}
+    env["PATH"] = os.environ.get("PATH", "/usr/bin:/bin")
+    # encoding="utf-8" обязателен: по умолчанию на Windows используется
+    # cp1251, и русские строки скрипта роняют декодирование с
+    # UnicodeDecodeError - тест падал бы из-за кодировки, а не из-за
+    # проверяемой логики.
+    # ВАЖНО: запускаем через `env -u HOME`. Простое удаление HOME из
+    # словаря НЕ работает: на Windows subprocess подставляет HOME
+    # заново из USERPROFILE, и скрипт видел её как всегда заданную.
+    # Тест проходил бы на сломанном коде - проверено: с сырым $HOME
+    # он оставался зелёным.
+    # C:\Users\... -> /c/Users/... : слеши и двоеточие убираем
+    # регуляркой. Через replace("\\\\","/") слеши съедались, и путь
+    # получался вида "cUsers..." без разделителей.
+    posix = re.sub(r"[\\:]+", "/", str(scripts / "run_bot.sh"))
+    posix = "/" + posix[0].lower() + posix[1:]
+    r = subprocess.run([bash, "-c", f"env -u HOME bash {posix}"],
+                       capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=60)
+    out = r.stdout + r.stderr
+    assert "unbound variable" not in out, (
+        f"скрипт падает без HOME: {out[:300]}")
+    assert "Запуск бота" in out, (
+        f"бот не стартовал без HOME: {out[:300]}")
