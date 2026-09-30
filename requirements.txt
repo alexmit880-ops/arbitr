@@ -2,3 +2,12 @@ ccxt==4.2.20
 aiohttp==3.9.1
 python-dotenv==1.0.0
 loguru==0.7.2
+
+# rich - дашборд (Layout/Live/Panel/Table/Text в app.py).
+#
+# Шаг 1.3: пакет ОТСУТСТВОВАЛ здесь, хотя app.py импортирует его пятью
+# строками (11-15). На риге бот падал при первом же запуске:
+#     ModuleNotFoundError: No module named 'rich'
+# и requirements это не ловил - файл просто был неполным. Версия
+# зафиксирована по фактически работающей (15.0.0).
+rich==15.0.0

@@ -303,3 +303,84 @@ def test_cleanup_batch_and_cap_constants_are_sane():
     assert 1000 <= engine.DB_CLEANUP_BATCH <= 500000, engine.DB_CLEANUP_BATCH
     assert 0.1 <= engine.DB_CLEANUP_MAX_SEC <= 10.0, engine.DB_CLEANUP_MAX_SEC
     assert 0.05 <= engine.DB_VACUUM_FREE_RATIO <= 1.0, engine.DB_VACUUM_FREE_RATIO
+
+
+# ─────────────── полнота requirements.txt ───────────────
+
+def _third_party_imports() -> set:
+    """Сторонние импорты верхнего уровня в app.py/engine.py/config.py."""
+    import ast
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    std = set(sys.stdlib_module_names) | {"config", "engine", "__future__"}
+    found = set()
+    for fn in ("app.py", "engine.py", "config.py"):
+        path = os.path.join(root, fn)
+        if not os.path.exists(path):
+            continue
+        tree = ast.parse(open(path, encoding="utf-8").read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for a in node.names:
+                    found.add(a.name.split(".")[0])
+            elif isinstance(node, ast.ImportFrom) and node.level == 0:
+                if node.module:
+                    found.add(node.module.split(".")[0])
+    return found - std
+
+
+def test_requirements_covers_all_imports():
+    """Каждый сторонний импорт обязан быть в requirements.txt.
+
+    Шаг 1.3: rich использовался в app.py пятью строками, но в
+    requirements.txt его не было. На риге бот упал при первом запуске:
+        ModuleNotFoundError: No module named 'rich'
+    Тест ловит это ДО выкатки, а не на боевой машине.
+    """
+    req = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "requirements.txt")
+    # Имя пакета в pip не обязано совпадать с именем модуля при импорте.
+    # python-dotenv ставится как "python-dotenv", а импортируется как
+    # "dotenv". Без этого соответствия тест ругается на пакет, который
+    # в requirements.txt есть - ложное срабатывание.
+    IMPORT_TO_PACKAGE = {"dotenv": "python-dotenv"}
+    declared = set()
+    for line in open(req, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            # "pkg==1.0", "pkg>=1.0", "pkg[extra]==1.0"
+            name = line.split("==")[0].split(">=")[0].split("<=")[0]
+            name = name.split(">")[0].split("<")[0].split("~=")[0]
+            name = name.split("[")[0].strip()
+            if name:
+                declared.add(name.lower().replace("_", "-"))
+    missing = sorted(
+        m for m in _third_party_imports()
+        if IMPORT_TO_PACKAGE.get(m, m).lower().replace("_", "-") not in declared
+    )
+    assert not missing, (
+        f"импортируется в коде, но нет в requirements.txt: {missing}. "
+        f"Бот упадёт на чистой машине с ModuleNotFoundError.")
+
+
+def test_rich_is_declared():
+    """Точечная проверка: rich нужен дашборду и был потерян."""
+    req = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "requirements.txt")
+    text = open(req, encoding="utf-8").read()
+    assert "rich" in text, "rich не зафиксирован в requirements.txt"
+    # Проверяем, что он реально доступен, а не только записан строкой.
+    import importlib
+    importlib.import_module("rich")
+
+
+def test_requirements_pins_versions():
+    """Зависимости зафиксированы - иначе риг и машина разъедутся."""
+    req = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "requirements.txt")
+    unpinned = []
+    for line in open(req, encoding="utf-8"):
+        line = line.strip()
+        if line and not line.startswith("#") and "==" not in line:
+            unpinned.append(line)
+    assert not unpinned, f"зафиксируйте версии: {unpinned}"
