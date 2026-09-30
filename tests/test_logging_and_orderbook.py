@@ -15,6 +15,7 @@
    отклонялись как blocked.
 """
 import os
+import time
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -197,3 +198,108 @@ def test_cleanup_keeps_recent_drops_old():
     conn.close()
     os.remove(p)
     assert left == 1, "осталось %d строк, ожидалась 1 (свежая)" % left
+
+
+# ────────────��── уборка БД: пакетность и потолок времени ───────────────────
+
+def _fresh_db(tmp_path, old_n=0, new_n=0):
+    """Мини-база opportunities как в проде (с индексом по ts)."""
+    import sqlite3, time
+    p = str(tmp_path / "t.db")
+    c = sqlite3.connect(p, check_same_thread=False)
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute(
+        "CREATE TABLE opportunities (id INTEGER PRIMARY KEY, ts INTEGER)")
+    c.execute("CREATE INDEX idx_opportunities_ts ON opportunities(ts)")
+    now = int(time.time())
+    # ВАЖНО: ts должен быть заведомо старше cutoff (now - 24ч).
+    # Раньше здесь было "now - 90000 + i", и при i > 3600 строка внутри
+    # блока "старых" оказывалась СВЕЖЕЙ - тест проверял не то и падал
+    # с "осталось 197400". Отсчитываем вниз от заведомо старой точки.
+    rows = [(now - 200000 - i,) for i in range(old_n)] + \
+           [(now - i,) for i in range(new_n)]
+    c.executemany("INSERT INTO opportunities (ts) VALUES (?)", rows)
+    c.commit()
+    return c
+
+
+def test_cleanup_is_time_capped(tmp_path):
+    """Уборка не должна блокировать запись дольше потолка.
+
+    Замер (2026-09-30): массовый DELETE 13.8 млн строк занимал 21 с, а
+    цикл бота - около 3 с, то есть эти секунды съедали торговые окна.
+    """
+    import asyncio, engine
+    c = _fresh_db(tmp_path, old_n=400000, new_n=1000)
+    db = engine.Database.__new__(engine.Database)
+    db.conn = c
+    db._writes_since_cleanup = 0
+    t = time.time()
+    asyncio.run(db._cleanup_old_opportunities())
+    elapsed = time.time() - t
+    assert elapsed <= engine.DB_CLEANUP_MAX_SEC + 2.0, (
+        "уборка заняла %.1f с, потолок %.1f" % (elapsed,
+                                                 engine.DB_CLEANUP_MAX_SEC))
+    c.close()
+
+
+def test_cleanup_does_not_blow_up_wal(tmp_path):
+    """Пакетами удаление не раздувает WAL.
+
+    Замер: массовый DELETE дал WAL 271 МБ, пакетами по 50 тыс. - 0 МБ.
+    """
+    import asyncio, engine, os
+    c = _fresh_db(tmp_path, old_n=300000, new_n=1000)
+    db = engine.Database.__new__(engine.Database)
+    db.conn = c
+    db._writes_since_cleanup = 0
+    asyncio.run(db._cleanup_old_opportunities())
+    wal = c.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    wal_path = str(tmp_path / "t.db") + "-wal"
+    wal_mb = os.path.getsize(wal_path) / 1048576 if os.path.exists(wal_path) else 0.0
+    assert wal_mb < 20, "WAL раздулся до %.1f МБ" % wal_mb
+    c.close()
+
+
+def test_cleanup_removes_all_old_rows(tmp_path):
+    """Пакетное удаление сходится: старых строк не остаётся."""
+    import asyncio, engine
+    c = _fresh_db(tmp_path, old_n=200000, new_n=1000)
+    db = engine.Database.__new__(engine.Database)
+    db.conn = c
+    db._writes_since_cleanup = 0
+    cutoff = int(time.time()) - engine.DB_OPPORTUNITIES_KEEP_SEC
+    for _ in range(30):          # запас итераций: срабатывает потолок времени
+        asyncio.run(db._cleanup_old_opportunities())
+        left = c.execute("SELECT COUNT(*) FROM opportunities WHERE ts < ?",
+                         (cutoff,)).fetchone()[0]
+        if left == 0:
+            break
+    assert left == 0, "осталось %d старых строк" % left
+    kept = c.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
+    assert kept == 1000, "свежие строки затронуты: осталось %d" % kept
+    c.close()
+
+
+def test_vacuum_only_when_base_is_bloated(tmp_path):
+    """VACUUM не гоняется впустую - только когда база распухла.
+
+    Замер: с VACUUM на каждой уборке бот терял 44 СЕКУНДЫ в сутки.
+    """
+    import inspect, engine
+    src = inspect.getsource(engine.Database._cleanup_old_opportunities)
+    assert "freelist_count" in src, "нет проверки freelist перед VACUUM"
+    assert "DB_VACUUM_FREE_RATIO" in src, "VACUUM без порога"
+    # VACUUM должен идти ПОСЛЕ commit, иначе sqlite отвечает
+    # "cannot VACUUM from within a transaction"
+    i_commit = src.index("self.conn.commit()")
+    i_vacuum = src.index('"VACUUM"')
+    assert i_commit < i_vacuum, "VACUUM до commit - упадёт с ошибкой"
+
+
+def test_cleanup_batch_and_cap_constants_are_sane():
+    """Константы уборки не должны быть абсурдными."""
+    import engine
+    assert 1000 <= engine.DB_CLEANUP_BATCH <= 500000, engine.DB_CLEANUP_BATCH
+    assert 0.1 <= engine.DB_CLEANUP_MAX_SEC <= 10.0, engine.DB_CLEANUP_MAX_SEC
+    assert 0.05 <= engine.DB_VACUUM_FREE_RATIO <= 1.0, engine.DB_VACUUM_FREE_RATIO

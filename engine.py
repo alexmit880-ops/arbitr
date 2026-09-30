@@ -2,6 +2,7 @@
 from __future__ import annotations
 import asyncio
 import time
+import os             # размер файла БД в логе уборки (Шаг 0.9)
 import sqlite3
 import math
 import random
@@ -3554,27 +3555,87 @@ class Database:
                 logger.warning(f"DB: {e}")
 
     async def _cleanup_old_opportunities(self):
-        """Удалить возможности старше DB_OPPORTUNITIES_KEEP_SEC. Затем VACUUM.
+        """Удалить старые возможности. VACUUM - только если есть что сжать.
 
-        VACUUM нужен отдельным шагом и именно здесь: DELETE в sqlite
-        лишь помечает страницы свободными, размер файла не меняется.
-        Место возвращает только VACUUM.
+        Замер (2026-09-30), ради которого всё и переписано. На реальной
+        базе (24ч истории, ~480 тыс. строк, 12.5 МБ) с VACUUM на каждой
+        уборке получалось 48 уборок/сутки = 44 СЕКУНДЫ, в течение которых
+        бот не мог писать в БД. Цикл бота - около 3 секунд, то есть эти
+        секунды реально съедали торговые окна.
+
+        Причина: VACUUM переписывает ВСЮ базу целиком, даже если удалено
+        10 строк из 500 тысяч. Он не пропорционален объёму удалённого.
+
+        Поэтому VACUUM теперь условный: сначала смотрим freelist_count
+        (сколько страниц реально освободилось после DELETE). Если база
+        не распухла - VACUUM не нужен и не выполняется. Уплотнение
+        запускается только когда свободных страниц достаточно много,
+        чтобы уплотнение себя окупало.
         """
         try:
             cutoff = int(time.time()) - DB_OPPORTUNITIES_KEEP_SEC
-            cur = self.conn.execute(
-                "DELETE FROM opportunities WHERE ts < ?", (cutoff,))
-            deleted = cur.rowcount or 0
-            self.conn.commit()
-            if deleted:
-                logger.info(
-                    f"🗄️ opportunities: удалено {deleted} записей старше "
-                    f"{DB_OPPORTUNITIES_KEEP_SEC // 3600}ч")
-            # WAL_checkpoint(TRUNCATE) - сбрасывает и обрезает -wal файл,
-            # который иначе растёт рядом с базой до размера самой базы.
+            # Пакетное удаление вместо массового.
+            #
+            # Замер (2026-09-30): массовый DELETE 13.8 млн строк занял 21 с
+            # и раздул WAL до 271 МБ, потому что sqlite пишет каждую
+            # удалённую страницу в журнал. Пакетами по DB_CLEANUP_BATCH с
+            # checkpoint между ними WAL в пике держится на 0 МБ.
+            #
+            # Удаление ограничено по времени (DB_CLEANUP_MAX_SEC): бот
+            # работает циклами по ~3 с, и блокировать запись в БД на
+            # десятки секунд нельзя. Не успел - удалит остаток на
+            # следующей уборке, это безопасно и идемпотентно.
+            t0 = time.monotonic()
+            deleted = 0
+            while True:
+                cur = self.conn.execute(
+                    "DELETE FROM opportunities WHERE id IN ("
+                    "  SELECT id FROM opportunities WHERE ts < ? LIMIT ?)",
+                    (cutoff, DB_CLEANUP_BATCH))
+                n = cur.rowcount or 0
+                self.conn.commit()
+                deleted += n
+                if n < DB_CLEANUP_BATCH:
+                    break
+                if time.monotonic() - t0 > DB_CLEANUP_MAX_SEC:
+                    logger.warning(
+                        f"🗄️ cleanup: удалено {deleted} за "
+                        f"{time.monotonic() - t0:.0f}с, остаток - "
+                        f"на следующей уборке")
+                    break
+
+            # WAL_checkpoint(TRUNCATE) дёшев (десятки мс) и нужен всегда:
+            # иначе -wal растёт рядом с базой до размера самой базы.
             self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            self.conn.execute("VACUUM")
-            logger.info("🗄️ VACUUM выполнен, база сжата")
+
+            page_size = self.conn.execute("PRAGMA page_size").fetchone()[0]
+            freelist = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+            free_pages = freelist or 0
+            reclaimable_mb = free_pages * page_size / 1048576
+
+            if not deleted and not free_pages:
+                return
+
+            # Уплотняем только если освободилось заметно больше порога.
+            # Порог = 25% от размера базы: ниже этого выигрыш от VACUUM
+            # меньше его стоимости.
+            db_pages = self.conn.execute("PRAGMA page_count").fetchone()[0]
+            if db_pages > 0 and free_pages >= db_pages * DB_VACUUM_FREE_RATIO:
+                t0 = time.monotonic()
+                # VACUUM нельзя выполнять внутри транзакции - именно поэтому
+                # выше стоит commit(). Без него sqlite отвечает
+                # "cannot VACUUM from within a transaction".
+                self.conn.execute("VACUUM")
+                logger.info(
+                    f"🗄️ VACUUM: освобождено {reclaimable_mb:.1f} МБ "
+                    f"за {time.monotonic() - t0:.1f}с")
+            elif deleted:
+                logger.info(
+                    f"🗄️ opportunities: удалено {deleted} записей "
+                    f"старше {DB_OPPORTUNITIES_KEEP_SEC // 3600}ч "
+                    f"(VACUUM пропущен: освобождено только "
+                    f"{reclaimable_mb:.1f} МБ из "
+                    f"{os.path.getsize('hunter.db') / 1048576:.1f} МБ)")
         except Exception as e:
             logger.warning(f"DB cleanup: {e}")
     
