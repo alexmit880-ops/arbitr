@@ -22,10 +22,15 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=user
-Group=user
-WorkingDirectory=/home/user/arbitr
-ExecStart=/home/user/arbitr/deploy/run_bot.sh
+# Шаг 1.2: раньше стояло User=user / Group=user и жёсткие пути
+# /home/user/arbitr. На Hive OS сессия может быть и от user, и от root
+# (у root домашний каталог /root), и тогда сервис не стартовал: не тот
+# пользователь, не тот каталог. Проверено на риге - был root.
+#
+# Пустые значения означают "текущий пользователь, от которого запущен
+# systemctl". Это работает в обоих случаях и не требует правки юнита.
+WorkingDirectory=%h/arbitr
+ExecStart=%h/arbitr/deploy/run_bot.sh
 
 # ВАЖНО: не on-failure, как в исходной инструкции.
 # Бот завершается возвратом из main() и ВСЕГДА отдаёт код 0 - даже
@@ -73,13 +78,13 @@ Nice=10
 # Только фатальные случаи, не дампы ядра: бот - обычный процесс.
 OOMPolicy=kill
 
-# Безопасность: сервису не нужно ни root, ни доступ к устройствам.
+# Безопасность: сервису не нужен доступ к устройствам. Запуск от того же
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
 # Запись нужна только в рабочий каталог (hunter.db, logs/)
-ReadWritePaths=/home/user/arbitr
+ReadWritePaths=%h/arbitr
 
 [Install]
 WantedBy=multi-user.target

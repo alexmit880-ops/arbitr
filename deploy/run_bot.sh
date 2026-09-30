@@ -22,11 +22,50 @@
 
 set -uo pipefail
 
-APP_DIR="/home/user/arbitr"
+# ─── Где лежит проект ───
+#
+# Шаг 1.2: раньше здесь было жёстко APP_DIR="/home/user/arbitr", и на риге
+# с правами root скрипт падал с "No such file or directory" - потому что
+# у root домашний каталог /root, а проект лежал в /root/arbitr.
+# Путь не угадывается: у Hive OS пользователь бывает и user, и root.
+#
+# Порядок поиска (первое сработавшее):
+#   1) первый аргумент скрипта, если он передан
+#   2) $HOME/arbitr - обычный случай
+#   3) ../arbitr относительно самого скрипта - если run_bot.sh положили
+#      рядом с проектом, а не в ~/scripts
+# Проверка не по существованию каталога, а по наличию app.py: пустой
+# каталог ~/arbitr существует, а проекта в нём нет.
+#
+# Про "$1" в "${1:-}": при set -u обращение к $1 без аргумента даёт
+# "unbound variable" и валит скрипт. Именно это и происходило - проверил
+# тестом с пустым списком аргументов.
+find_app_dir() {
+    local cand script_dir
+    script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+    for cand in "${1:-}" "$HOME/arbitr" "$script_dir/../arbitr"; do
+        if [ -n "$cand" ] && [ -f "$cand/app.py" ]; then
+            readlink -f "$cand"
+            return 0
+        fi
+    done
+    return 1
+}
+
+APP_DIR="$(find_app_dir "${1:-}")" || {
+    echo "FATAL: не нашёл каталог с app.py."
+    # "${1:-пусто}" а не "$1": при set -u обращение к $1 без аргумента
+    # даёт "unbound variable" - то есть вместо понятного сообщения
+    # пользователь получил бы ошибку bash.
+    echo "Проверил: '${1:-<аргумент не передан>}', '$HOME/arbitr', <каталог скрипта>/../arbitr"
+    echo "Запустите с явным путём: $0 /путь/к/проекту"
+    exit 78
+}
+
 LOG_DIR="${APP_DIR}/logs"
 PYTHON="${APP_DIR}/venv/bin/python"
 
-cd "$APP_DIR" || { echo "FATAL: нет каталога $APP_DIR"; exit 78; }
+cd "$APP_DIR" || { echo "FATAL: не могу перейти в $APP_DIR"; exit 78; }
 mkdir -p "$LOG_DIR"
 
 if [ ! -x "$PYTHON" ]; then
