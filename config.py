@@ -177,6 +177,17 @@ MAX_TRADABLE_SPREAD_PCT = float(os.getenv("MAX_TRADABLE_SPREAD_PCT", "0.5"))
 # скольжение) без спреда даёт 1.440%, а измеренный round-trip при нулевом
 # спреде — 1.248%. Разница 0.192% ~= типичный спред USDT-пары (0.2%).
 SPREAD_REFERENCE_PCT = float(os.getenv("SPREAD_REFERENCE_PCT", "0.20"))
+
+# Амортизированная стоимость перевода между биржами, % (Шаг 0.5).
+#
+# Полная ставка 0.20% применяться к КАЖДОЙ сделке неверна. Измерено:
+# балансы бирж расходятся на -0.72 USDT за сделку на спотовой ноге,
+# то есть при стартовых 800 USDT перевод требуется раз в ~1100 сделок.
+# Амортизированная стоимость: 0.20 / 1100 = 0.00018%.
+#
+# Закладываем 0.02% - в 100 раз выше расчётного, с запасом на
+# ребалансировку при изменении волатильности и на дрейф балансов.
+TRANSFER_AMORTIZED_PCT = float(os.getenv("TRANSFER_AMORTIZED_PCT", "0.02"))
 FUTURES_FUNDING_RATE_PER_HOUR = float(os.getenv("FUTURES_FUNDING_RATE_PER_HOUR", "0"))
 KELLY_FRACTION = 0.25
 KELLY_FRACTION_EARLY = 0.10

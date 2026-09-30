@@ -341,21 +341,45 @@ class BasisEntryCriteria:
         Полные расходы на вход + выход, в процентах от размера.
 
         ФОРМУЛА ВЫВЕДЕНА ИЗМЕРЕНИЯМИ, а не взята из модели (Шаг 0.4).
-        Проверена на 7 точках с погрешностью <= 0.023%:
 
-            cost = комиссии + перевод + скольжение
-                   - spread_ref + 2*(spread_buy + spread_sell)
+            cost = комиссии + перевод_амортиз + скольжение
+                   + 2*(spread_buy + spread_sell)
 
-        где spread_ref - типичный спред (0.2% для USDT-пар на ликвидных
-        биржах), введённый потому, что базовая формула без спреда
-        занижает результат: измерение при нулевом спреде даёт 1.248%
-        против расчётных 1.440%.
+        Проверена на измерениях с погрешностью <= 0.012%:
+            спреды 0.0/0.0 -> измерено 1.248%  (формула 1.260)
+            спреды 0.2/0.2 -> измерено 2.051%  (формула 2.060)
+            спреды 0.4/0.4 -> измерено 2.850%  (формула 2.860)
 
         Множитель 2 у спредов не ошибка: каждая нога пересекает свой
         спред дважды — на входе (покупка по ask / продажа по bid) и на
         выходе (продажа по bid / покупка по ask).
 
-        Измерения (size=100):
+        РАНЬШЕ ЗДЕСЬ БЫЛА ПОПРАВКА -0.20 (SPREAD_REFERENCE_PCT). Она
+        подбиралась как компенсация перевода 0.20% в формуле: измерения
+        делались БЕЗ перевода (деньги не двигались), а формула его
+        учитывала, и поправка их согласовывала.
+
+        После удаления перевода (Шаг 0.5) поправка стала ВТОРОЙ ошибкой
+        подряд: с ней погрешность выросла до 0.19%, без неё — 0.01%.
+        То есть -0.20 компенсировала ровно то, что убрали. Удалена.
+
+        ПЕРЕВОД УБРАН из расходов входа (Шаг 0.5, 2026-09-30).
+        Основание - измерение, а не рассуждение:
+          * в BalanceManager НЕТ операции перевода средств (проверено:
+            ни transfer, ни rebalance, ни withdraw);
+          * transfer_fee вычитался из PnL, но нигде не двигал деньги -
+            то есть был расходом без события;
+          * балансы бирж расходятся медленно: измерено -0.72 USDT за
+            сделку на спотовой ноге, +4.10 на фьючерсной;
+          * при стартовых 800 USDT на биржу спотовая нога исчерпывается
+            через ~1100 сделок, то есть перевод нужен раз в 1100 сделок,
+            а не в каждой.
+
+        Амортизированная стоимость: 0.20% / 1100 = 0.00018% на сделку.
+        Закладываем 0.02% - с запасом на ребалансировку при изменении
+        волатильности и на дрейф балансов между биржами.
+
+        Измерения (size=100), для проверки формулы:
             спреды 0.0/0.0 -> 1.248%   (предсказано 1.240)
             спреды 0.2/0.2 -> 2.051%   (предсказано 2.040)
             спреды 0.4/0.4 -> 2.850%   (предсказано 2.840)
@@ -364,16 +388,17 @@ class BasisEntryCriteria:
         fee_sell = TRADING_FEES.get(sell_t.exchange, 0.001)
         commission = 2.0 * (fee_buy + fee_sell) * 100.0
 
-        transfer = (WITHDRAWAL_FEES.get(buy_t.exchange, 1.0)
-                    + WITHDRAWAL_FEES.get(sell_t.exchange, 1.0)) / 10.0
+        # Перевод: амортизированная оценка вместо полной ставки на сделку.
+        transfer = TRANSFER_AMORTIZED_PCT
 
         slip = ProfitCalculator.calculate_slippage(size_usdt)
         slippage = slip * 4.0 * 100.0
 
         spread = (buy_t.bid_ask_spread_pct()
                   + sell_t.bid_ask_spread_pct())
-        # калибровочный сдвиг: см. докстринг
-        spread_cost = 2.0 * spread - SPREAD_REFERENCE_PCT
+        # Каждый спред учитывается дважды: нога пересекает его на входе
+        # (покупка по ask / продажа по bid) и на выходе (наоборот).
+        spread_cost = 2.0 * spread
 
         return commission + transfer + slippage + spread_cost
 
@@ -2033,7 +2058,17 @@ class ExchangePool:
             ex = getattr(ccxt, name)({
                 "enableRateLimit": True,
                 "timeout": 20000,
-                "options": {"defaultType": "future", "fetchCurrencies": False},
+                # ВОССТАНОВЛЕНО (Шаг 0.5): было defaultType="future".
+            # Проверено перебором на живых данных:
+            #   mexc future -> fetch_tickers() = None (падает)
+            #   mexc swap   -> 1210 тикеров, 1093 перпетуала
+            #   okx   future -> 254 тикера, 0 с /USDT (только деривативы
+            #                   вида SOL/USD:USD-261030 - календарные
+            #                   фьючерсы, не перпетуалы)
+            #   okx   swap   -> 494 тикера, 479 перпетуалов
+            # Для арбитража против спота нужен ПЕРПЕТУАЛ: у календарного
+            # фьючерса другая дата экспирации и другое имя символа.
+            "options": {"defaultType": "swap", "fetchCurrencies": False},
             })
             await asyncio.wait_for(ex.load_markets(), timeout=15)
             if not ex.markets:
@@ -2042,8 +2077,21 @@ class ExchangePool:
             self.futures_clients[name] = ex
             self.futures_exchanges.add(name)
             for symbol in ex.markets:
-                if "/USDT" in symbol and ":USDT" not in symbol:
-                    self.futures_symbols_per_exchange.setdefault(symbol, set()).add(name)
+                # ВОССТАНОВЛЕНО (Шаг 0.5): условие было
+                #   if "/USDT" in symbol and ":USDT" not in symbol:
+                # то есть перпетуалы вида "SOL/USDT:USDT" ОТБРАСЫВАЛИСЬ.
+                #
+                # Последствие: futures_symbols_per_exchange содержал только
+                # спотовые имена, а update_futures_one клал в кэш ключи с
+                # ":USDT". Расхождение имён означало, что resolve_futures_symbol
+                # не находил пару для mexc/okx/gate — в живом прогоне 36
+                # возможностей, из них 0 котировок второй ноги.
+                #
+                # Перпетуал - это и есть тот инструмент, который нужен для
+                # арбитража против спота, поэтому ":USDT" теперь норма.
+                if "/USDT" in symbol:
+                    self.futures_symbols_per_exchange.setdefault(
+                        symbol, set()).add(name)
             logger.info(f"✅ {name} futures: {len([s for s in ex.markets if '/USDT' in s])} пар")
         except Exception:
             pass
@@ -3046,8 +3094,21 @@ class SpotFuturesPaperTrader(PaperTrader):
             # быстрее реального. Теперь единицы совпадают.
             funding = p.margin * self.funding_rate_per_hour * hours_held
 
+            # ПЕРЕВОД НЕ вычитается здесь (Шаг 0.5).
+            #
+            # Раньше стояло `- p.transfer_fee` в расчёте PnL. Это было
+            # неверно вдвойне:
+            #   1) в BalanceManager нет операции перевода - деньги никуда
+            #      не двигались, то есть платился расход без события;
+            #   2) transfer_fee = size * (w/1000) - полная ставка на КАЖДУЮ
+            #      сделку, тогда как балансы расходятся на -0.72 USDT за
+            #      сделку и перевод нужен раз в ~1100 сделок.
+            #
+            # Перенос между биржами уже учтён амортизированной ставкой
+            # TRANSFER_AMORTIZED_PCT в BasisEntryCriteria._costs_pct(),
+            # то есть в расчёте записи при входе, где её видно в логах.
             pnl = (spot_pnl + fut_pnl - exit_spot_fee - exit_fut_fee
-                   - p.transfer_fee - funding)
+                   - funding)
             pnl_pct = (pnl / p.size_usdt * 100) if p.size_usdt > 0 else 0.0
 
             self._close_pair(p, spot_exit, fut_exit, spot_rev, fut_rev,
