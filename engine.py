@@ -139,15 +139,31 @@ class RealityCheck:
         return max(0.0, size)
 
     @staticmethod
-    def check(opp: Opportunity, prices: Dict[str, "Ticker"], portfolio: "Portfolio") -> RealityCheckResult:
+    def check(opp: Opportunity, prices: Dict[str, "Ticker"],
+              portfolio: "Portfolio", confidence_min: float = None
+              ) -> RealityCheckResult:
         buy_t = prices.get(opp.buy_exchange)
         sell_t = prices.get(opp.sell_exchange)
         size = RealityCheck.planned_size(portfolio, opp)
 
         if not buy_t or not sell_t:
             return RealityCheckResult(False, "missing_quotes", planned_size_usdt=size)
-        if opp.confidence_score < REALITY_MIN_CONFIDENCE:
-            return RealityCheckResult(False, "low_confidence", planned_size_usdt=size)
+        # БЫЛО: if opp.confidence_score < REALITY_MIN_CONFIDENCE:  # жёсткие 60
+        #
+        # Здесь стоял ТРЕТИЙ независимый порог уверенности (60), пока
+        # RiskManager и app.py проверяли 50, а потом 40. Три разных числа
+        # в трёх местах: система проходила первый фильтр (40) и тут же
+        # отсекалась вторым (60) — то есть калибровка порога не давала
+        # НИКАКОГО эффекта.
+        #
+        # Теперь порог передаётся явно и по умолчанию равен 40 (режим
+        # бутстрапа). app.py передаёт trader.risk.get_confidence_threshold(),
+        # то есть все три фильтра читают ОДНО значение.
+        conf_min = REALITY_BOOTSTRAP_MIN_CONFIDENCE if confidence_min is None else confidence_min
+        if opp.confidence_score < conf_min:
+            return RealityCheckResult(
+                False, f"low_confidence ({opp.confidence_score:.1f} < {conf_min})",
+                planned_size_usdt=size)
         if opp.net_profit_pct < REALITY_MIN_NET_PROFIT_PERCENT:
             return RealityCheckResult(False, "low_net_profit", planned_size_usdt=size)
         if opp.spread_pct > REALITY_MAX_SPREAD_WITHOUT_L2:
@@ -1330,9 +1346,28 @@ class LifetimeTracker:
                     del self.active[symbol]
     
     def get_repeatability(self, symbol: str, path: str) -> float:
+        """
+        Повторяемость возможностей по наблюдениям.
+
+        ВОССТАНОВЛЕНО (Шаг 0.3, 2026-09-30): при отсутствии данных
+        возвращается НЕЙТРАЛЬНОЕ 50.0 вместо 0.0.
+
+        Почему 0.0 был ошибкой: ноль на шкале 0-100 означает
+        "гарантированно плохо", а отсутствие наблюдений означает
+        "неизвестно". Скоринг наказывал систему за то, что она только
+        запустилась, и порождал петлю:
+
+            history      = f(закрытых сделок)  = 0
+            закрытые     = f(confidence >= порога)
+            confidence   < порога, потому что history = 0
+
+        Петля не могла разорваться САМА: пока порог недостижим, история
+        не накапливается, а пока истории нет — порог недостижим.
+        Нейтральное 50.0 честно выражает "не знаю" и допускает старт.
+        """
         lifetimes = self.history.get(symbol, {}).get(path, [])
         if len(lifetimes) < LIFETIME_MIN_SAMPLES:
-            return 0.0
+            return 50.0
         count = len(lifetimes)
         avg_life = sum(lifetimes) / len(lifetimes)
         return min(100, math.log1p(count) * 15 + avg_life * 0.5)
@@ -1551,7 +1586,23 @@ class ConfidenceScorer:
         # на пустом месте (age_sec() тут меряет только "давно ли МЫ
         # опросили", а не "насколько свежа цена на самой бирже").
         max_age = max(buy_t.age_sec(), sell_t.age_sec())
-        freshness_score = max(0, 100 - max_age * 15)
+        # КАЛИБРОВКА (Шаг 0.3, 2026-09-30).
+        #
+        # Раньше: freshness_score = max(0, 100 - max_age * 15)
+        # При CACHE_REFRESH_SEC=3 коэффициент 15/сек обнуляет оценку уже
+        # через 6.7 секунды, тогда как нормальный возраст котировки между
+        # обновлениями кэша — 1.5-3 секунды. То есть компонент гас по
+        # замыслу, а не из-за реальной расхожести цены: терялось ~5 баллов
+        # на каждой сделки.
+        #
+        # Теперь шкала привязана к интервалу обновления кэша:
+        #   возраст = 2 x CACHE_REFRESH_SEC -> 50 баллов
+        #   возраст = 4 x CACHE_REFRESH_SEC -> 0 баллов
+        # Границы не выдуманы: при 3-секундном цикле 6 секунд — это
+        # два пропущенных обновления (цена объективно устарела), а
+        # 12 секунд — четыре.
+        age_per_50 = max(1.0, CACHE_REFRESH_SEC * 2)
+        freshness_score = max(0.0, 100.0 - max_age * (50.0 / age_per_50))
         if not (buy_t.has_exchange_timestamp and sell_t.has_exchange_timestamp):
             freshness_score = min(freshness_score, 50)
         breakdown["freshness"] = freshness_score * CONFIDENCE_WEIGHTS["freshness"] / 100
@@ -2217,12 +2268,44 @@ class RiskManager:
             base_size = max(base_size, MIN_TRADE_SIZE)
         return min(base_size, MAX_TRADE_SIZE)
     
-    def can_trade(self, opp: Opportunity, confidence_min: float = 50.0) -> Tuple[bool, str]:
+    def get_confidence_threshold(self) -> float:
+        """
+        Порог уверенности, зависящий от зрелости системы.
+
+        Логика: сначала собираем статистику, потом ужесточаем.
+        Это НЕ снижение планки навсегда — планка растёт по мере
+        накопления закрытых сделок.
+
+        Зачем это нужно: confidence частично определяется историей
+        закрытых сделок (повторяемость), а история накапливается только
+        совершёнными сделками. При фиксированном пороге 50 система на
+        холодном старте не могла сделать ни одной сделки, потому что
+        history = 0 у всех возможностей, — то есть порог был
+        недостижим в принципе.
+
+        Ступени:
+            <  KELLY_MIN_TRADES (20)  -> 40.0  бутстрап
+            <  KELLY_FULL_TRADES (100)-> 45.0  рост
+            >= KELLY_FULL_TRADES      -> 50.0  зрелость
+        """
+        n = len(self.portfolio.closed_trades)
+        if n < KELLY_MIN_TRADES:
+            return 40.0
+        if n < KELLY_FULL_TRADES:
+            return 45.0
+        return 50.0
+
+    def can_trade(self, opp: Opportunity, confidence_min: float = None) -> Tuple[bool, str]:
         p = self.portfolio
         p.check_daily_reset()
-        
+
+        # confidence_min=None означает "взять порог по зрелости системы".
+        # Явное число переопределяет (так пишут старые тесты).
+        if confidence_min is None:
+            confidence_min = self.get_confidence_threshold()
+
         if opp.confidence_score < confidence_min:
-            return False, f"Low conf"
+            return False, f"Low conf ({opp.confidence_score:.1f} < {confidence_min})"
         if opp.net_profit_pct < 0:
             return False, "Negative"
         if p.daily_pnl < -(p.initial_balance * MAX_DAILY_LOSS_PERCENT / 100):
@@ -2523,6 +2606,39 @@ class SpotFuturesPaperTrader(PaperTrader):
         # ОТКРЫТЫЕ ПАРЫ — то, чего не хватало. Переживают циклы.
         self.open_pairs: Dict[str, OpenPair] = {}
 
+    @staticmethod
+    def resolve_futures_symbol(futures_prices: Optional[Dict[str, Any]],
+                               spot_symbol: str) -> Optional[str]:
+        """
+        Находит ключ перпетуального фьючерса для спотового символа.
+
+        ЗАЧЕМ (Шаг 0.3, 2026-09-30): спот и перпетуал именуются по-разному:
+            спот:        "SOL/USDT"
+            перпетуал:   "SOL/USDT:USDT"
+        Раньше execute() искал futures_prices[opp.symbol] напрямую, то есть
+        "SOL/USDT" в словаре, где лежат только ":USDT". Проверено на живых
+        данных: точное совпадение символов — 0 из 519, при этом совпадений
+        по базовому активу 519. То есть вторая нога стратегии не находилась
+        НИКОГДА, и любая сделка отклонялась с no_futures_ticker.
+
+        Порядок поиска:
+          1. точный ключ (если биржа отдала спот-подобное имя)
+          2. "<symbol>:USDT" — стандартный перпетуал ccxt
+          3. перебор: любой ключ с тем же базовым активом
+        """
+        if not futures_prices:
+            return None
+        if spot_symbol in futures_prices:
+            return spot_symbol
+        perp = f"{spot_symbol}:USDT"
+        if perp in futures_prices:
+            return perp
+        base = spot_symbol.split("/")[0]
+        for key in futures_prices:
+            if key.split("/")[0] == base:
+                return key
+        return None
+
     def _reject(self, opp, reason: str, synthetic: float = 0.0):
         self.rejected_counters[reason] = self.rejected_counters.get(reason, 0) + 1
         if self.shadow_logger is not None:
@@ -2576,8 +2692,10 @@ class SpotFuturesPaperTrader(PaperTrader):
         # код молча брал sell_t из prices (СПОТ) вместо фьючерса. Разбираем
         # оба случая явно.
         buy_t = prices.get(opp.buy_exchange)
-        fut_sym = (futures_prices or {}).get(opp.symbol) or {}
-        sell_t = fut_sym.get(opp.sell_exchange)
+        # Резолвим ключ фьючерса: спот "SOL/USDT" против перпетуала
+        # "SOL/USDT:USDT" (см. resolve_futures_symbol).
+        fut_key = self.resolve_futures_symbol(futures_prices, opp.symbol)
+        sell_t = ((futures_prices or {}).get(fut_key) or {}).get(opp.sell_exchange)
         if sell_t is None:
             return self._reject(opp, "no_futures_ticker", opp.net_profit_pct)
         if not buy_t:
@@ -2702,7 +2820,10 @@ class SpotFuturesPaperTrader(PaperTrader):
             # только фьючерс, поэтому spot_t был None и закрытие падало.
             sym_prices = prices.get(sym) or {}
             spot_t = sym_prices.get(p.buy_exchange)
-            fut_sym = (futures_prices or {}).get(sym) or {}
+            # Тот же резолв символа, что и в execute(): спот "SOL/USDT"
+            # против перпетуала "SOL/USDT:USDT".
+            fut_key = self.resolve_futures_symbol(futures_prices, sym)
+            fut_sym = (futures_prices or {}).get(fut_key) or {}
             fut_t = fut_sym.get(p.sell_exchange) or \
                 sym_prices.get(p.sell_exchange)
             if not spot_t or not fut_t:

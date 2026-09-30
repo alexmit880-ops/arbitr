@@ -68,6 +68,19 @@ MAX_POSITION_PCT_OF_BALANCE = 0.05
 
 # Reality check before paper execution. Conservative filters reduce fake paper PnL.
 REALITY_MIN_CONFIDENCE = float(os.getenv("REALITY_MIN_CONFIDENCE", "60"))
+# Порог уверенности для RealityCheck.check() на холодном старте.
+#
+# Зачем отдельная константа (Шаг 0.3, 2026-09-30): RealityCheck стоял на
+# жестких 60, тогда как RiskManager и app.py использовали 50, а затем 40.
+# Три разных порога в трех местах: система проходила первый фильтр и тут
+# же отсекалась вторым, из-за чего калибровка порога не давала НИКАКОГО
+# эффекта - сделок по-прежнему не было ни одной.
+#
+# Значение 40 совпадает с порогом бутстрапа в
+# RiskManager.get_confidence_threshold(). Фактическое значение в рантайме
+# берется оттуда (app.py передает его явно), а 40 - безопасный дефолт.
+REALITY_BOOTSTRAP_MIN_CONFIDENCE = float(
+    os.getenv("REALITY_BOOTSTRAP_MIN_CONFIDENCE", "40"))
 REALITY_MIN_NET_PROFIT_PERCENT = float(os.getenv("REALITY_MIN_NET_PROFIT_PERCENT", "0.5"))
 REALITY_MAX_SPREAD_WITHOUT_L2 = float(os.getenv("REALITY_MAX_SPREAD_WITHOUT_L2", "12"))
 REALITY_MAX_INTERNAL_SPREAD_PCT = float(os.getenv("REALITY_MAX_INTERNAL_SPREAD_PCT", "1.5"))

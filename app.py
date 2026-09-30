@@ -553,6 +553,14 @@ async def main():
     last_alert: Dict[str, float] = {}
     cycle = 0
     best_found = None
+    # Счётчики для алерта «возможности есть, сделок нет» (Шаг 0.3).
+    # Раньше в плане упоминались metrics.counters и recent_opportunities —
+    # таких объектов в коде нет: `metrics` здесь имя панели dashboard, а
+    # список последних возможностей не вёлся. Счётчики заведены здесь,
+    # по реальным данным цикла.
+    opps_seen_last_hour: int = 0
+    best_conf_last_hour: float = 0.0
+    no_trade_warned_at: float = 0.0
     zombie_alerts: List[str] = []
     known_zombies: Set[str] = set()
     zombie_since: Dict[str, float] = {}
@@ -782,7 +790,17 @@ async def main():
                         # которая должна была ловить обман.
                         # Теперь переменная явная и обнуляется на каждой итерации.
                         l2_obj = None
-                        if opp.confidence_score >= 50 and opp.net_profit_pct > 0:
+                        # Порог берётся из RiskManager, а не из литерала 50.
+                        # Раньше здесь стояло `opp.confidence_score >= 50`,
+                        # из-за чего динамический порог в RiskManager был
+                        # бы мёртвым: app.py отсекал бы возможности ДО того,
+                        # как дошло до вызова can_trade(). Два разных порога
+                        # в двух местах — источник расхождений.
+                        #
+                        # Владелец RiskManager здесь — trader.risk, отдельной
+                        # переменной `risk` в main() нет.
+                        conf_threshold = trader.risk.get_confidence_threshold()
+                        if opp.confidence_score >= conf_threshold and opp.net_profit_pct > 0:
                             try:
                                 if not exchange_health.is_healthy(opp.buy_exchange) or not exchange_health.is_healthy(opp.sell_exchange):
                                     if cycle % 5 == 0:
@@ -799,7 +817,10 @@ async def main():
                                     if cycle % 5 == 0:
                                         dashboard.add_log(f"⏭️ {opp.symbol} blocked: {delay_reason}")
                                     continue
-                                reality = RealityCheck.check(opp, prices.get(opp.symbol, {}), portfolio)
+                                reality = RealityCheck.check(
+                                    opp, prices.get(opp.symbol, {}), portfolio,
+                                    confidence_min=conf_threshold,
+                                )
                                 if not reality.allowed:
                                     if (L2_REALITY_CHECK_ENABLED
                                             and reality.reason in {"spread_requires_l2", "wide_internal_spread"}):
@@ -904,7 +925,13 @@ async def main():
                                 exec_opp.net_profit_pct = opp.net_profit_pct
                                 trade = await trader.execute(
                                     exec_opp, prices.get(opp.symbol, {}),
-                                    futures_prices=cache.futures_prices.get(opp.symbol, {}),
+                                    # Словарь фьючерсов передаётся ЦЕЛИКОМ, а не
+                                    # по ключу opp.symbol: спот называется
+                                    # "SOL/USDT", перпетуал — "SOL/USDT:USDT",
+                                    # и .get(opp.symbol) молча возвращал {}.
+                                    # Ключ подбирает resolve_futures_symbol()
+                                    # внутри execute().
+                                    futures_prices=cache.futures_prices,
                                     funding_tracker=funding_tracker,
                                 )
 
@@ -1054,6 +1081,40 @@ async def main():
                             if not best_found or opp.confidence_score > best_found.confidence_score:
                                 best_found = opp
                 
+                # АЛЕРТ: возможности есть, сделок нет (Шаг 0.3).
+                #
+                # Смысл: петля «confidence ниже порога -> нет сделок -> нет
+                # истории -> confidence ещё ниже» внешне неотличима от
+                # «рынка нет». Этот блок делает её видимой сразу.
+                try:
+                    if all_opps:
+                        opps_seen_last_hour += len(all_opps)
+                        best_conf_last_hour = max(
+                            best_conf_last_hour,
+                            max(o.confidence_score for o in all_opps))
+                    if cycle % 60 == 0:      # ~3 мин при цикле 3 с
+                        now_ts = time.time()
+                        recent_closed = sum(
+                            1 for t in portfolio.closed_trades
+                            if now_ts - t.timestamp < 3600)
+                        if opps_seen_last_hour > 0 and recent_closed == 0:
+                            if now_ts - no_trade_warned_at > 1800:
+                                no_trade_warned_at = now_ts
+                                thr = trader.risk.get_confidence_threshold()
+                                msg = (
+                                    f"0 trades/hour despite "
+                                    f"{opps_seen_last_hour} opportunities | "
+                                    f"best_conf={best_conf_last_hour:.1f} "
+                                    f"threshold={thr} | "
+                                    f"closed_total={len(portfolio.closed_trades)}"
+                                )
+                                logger.warning("⚠️ " + msg)
+                                dashboard.add_log("⚠️ " + msg)
+                                opps_seen_last_hour = 0
+                                best_conf_last_hour = 0.0
+                except Exception as e:
+                    logger.debug(f"No-trade alert: {e}")
+
                 try:
                     exchange_health.log_warnings(logger)
                     trader_stats = trader.stats() if trader else {}
