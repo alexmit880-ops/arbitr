@@ -1226,18 +1226,26 @@ class FundingRateTracker:
         rates = {}
         for ex_name, client in pool.futures_clients.items():
             try:
-                # ccxt unified: fetch_funding_rate(symbol) or fetch_funding_rates()
-                # We need USDT perpetual — try common symbols
+                # ccxt unified: fetch_funding_rate(symbol) или fetch_funding_rates()
+                # Нужен USDT perpetual — пробуем типовые символы.
+                #
+                # ВАЖНО (Шаг 0.5): вызовы ниже БЫЛИ без await. ccxt-методы
+                # асинхронные, поэтому они создавали корутину и сразу
+                # отбрасывали её, а try/except Exception никогда не
+                # срабатывал. Следствия:
+                #   - funding ВСЕГДА был 0.0 (в логах: "bybit: 0.0000%")
+                #   - при аварии запроса исключение не ловилось вовсе
+                #   - RuntimeWarning: coroutine ... was never awaited
+                # То есть расход на удержание позиции не учитывался, и PnL
+                # систематически завышался на величину funding.
                 result = None
-                try:
-                    result = client.fetch_funding_rate("BTC/USDT:USDT")
-                except Exception:
-                    pass
-                if result is None:
+                for sym in ("BTC/USDT:USDT", "BTC/USDT"):
                     try:
-                        result = client.fetch_funding_rate("BTC/USDT")
+                        result = await client.fetch_funding_rate(sym)
+                        if result:
+                            break
                     except Exception:
-                        pass
+                        result = None
                 if result is not None and isinstance(result, dict):
                     raw = result.get("fundingRate") or result.get("funding_rate") or 0
                     # Convert 8h rate to hourly
@@ -2929,6 +2937,34 @@ class Database:
                 PRIMARY KEY (exchange, asset)
             )
         """)
+        # МИГРАЦИЯ СХЕМЫ (Шаг 0.5, 2026-09-30).
+        #
+        # CREATE TABLE IF NOT EXISTS НЕ добавляет колонки в уже существующую
+        # таблицу: если trades уже была создана старой версией кода, новые
+        # поля молча не появляются. Итог — get_open_trades() падал с
+        #     "no such column: buy_ex"
+        # а save_open_trade() падал бы на каждой сделке, то есть запись
+        # открытых пар в БД не работала вовсе.
+        #
+        # Миграция идемпотентна: каждый ALTER выполняется только если колонки
+        # ещё нет, поэтому её безопасно звать на каждом старте. Существующие
+        # строки не трогаются — ALTER TABLE ADD COLUMN их не затрагивает.
+        for col, decl in (
+            ("status", "TEXT DEFAULT 'closed'"),
+            ("buy_ex", "TEXT"),
+            ("sell_ex", "TEXT"),
+            ("size_usdt", "REAL"),
+            ("buy_price", "REAL DEFAULT 0"),
+            ("sell_price", "REAL DEFAULT 0"),
+        ):
+            try:
+                self.conn.execute(
+                    f"ALTER TABLE trades ADD COLUMN {col} {decl}")
+                logger.info(f"🗄️ trades: добавлена колонка {col}")
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" — колонка уже есть, это норма
+                if "duplicate column" not in str(e).lower():
+                    raise
         self.conn.commit()
         while True:
             try:
