@@ -482,3 +482,61 @@ def test_no_boolean_console_argument():
     assert "else False" not in _code, "console получает bool"
     # screen всё ещё должен зависеть от TTY (это было полезное изменение)
     assert "screen=_interactive" in _code, "screen должен зависеть от TTY"
+
+
+# ──────── запуск сервиса на Linux (Шаги 1.6-1.7) ────────
+
+def test_entrypoint_is_executable_in_git():
+    """run_bot.sh обязан лежать в git с битом исполнения (100755).
+
+    Шаг 1.7: файл был 100644, поэтому на риге systemd давал
+        status=203/EXEC
+    Право выставлялось вручную chmod +x на КОПИИ в ~/scripts/, а
+    ExecStart запускал deploy/run_bot.sh, где прав не было. На
+    Windows chmod не работает и core.fileMode=false, поэтому бит
+    обязан быть проставлен в индексе git явно.
+    """
+    import subprocess
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run(
+        ["git", "ls-files", "-s", "deploy/run_bot.sh"],
+        cwd=root, capture_output=True, text=True).stdout.strip()
+    assert out, "run_bot.sh не отслеживается git"
+    mode = out.split()[0]
+    assert mode == "100755", (
+        f"режим {mode}, а нужен 100755 - на Linux будет 203/EXEC")
+
+
+def test_service_runs_script_via_bash():
+    """ExecStart должен идти через bash - тогда бит исполнения не важен.
+
+    Даже при 100644 в репозитории (или после scp/распаковки, или на
+    ФС с noexec) сервис запустится. Экономит разбор 203/EXEC.
+    """
+    import app  # noqa: F401 - не нужен, импорт ради проверки окружения
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "deploy", "arb-bot.service"),
+                encoding="utf-8").read()
+    _code = "\n".join(ln for ln in text.splitlines()
+                      if not ln.strip().startswith("#"))
+    assert "ExecStart=/bin/bash " in _code, (
+        "ExecStart должен вызывать /bin/bash, а не запускать файл "
+        "напрямую: иначе 203/EXEC при любом потерянном бите +x")
+    assert "%h/arbitr" in _code, "путь должен быть через %h, а не жёсткий"
+
+
+def test_gitattributes_forces_lf():
+    """Для .sh и .service обязателен eol=lf (Шаг 1.6).
+
+    С core.autocrlf=true на Windows скрипты приходили на Linux с CRLF,
+    и shebang читался как "/bin/bash\r" - файл не существует.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, ".gitattributes")
+    assert os.path.exists(path), "нет .gitattributes - CRLF вернётся"
+    text = open(path, encoding="utf-8").read()
+    assert "*.sh text eol=lf" in text, "нет правила для .sh"
+    assert "*.service text eol=lf" in text, "нет правила для .service"
