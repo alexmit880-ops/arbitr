@@ -1132,7 +1132,7 @@ async def main():
                                         pair = trader.open_pairs[opp.symbol]
                                         # Помечаем, чтобы повторно не писать
                                         await db.save_open_trade(
-                                            opp, pair.size_usdt, opp.category)
+                                            pair, opp.category)
                                         pair.notes = "saved"
                                         pair_ranker.record(opp, executed=True)
                                         replay.record_decision(
@@ -1174,9 +1174,16 @@ async def main():
                                     # честным окном между ногами сделки — сюда нужно
                                     # будет вернуть открытие ДО коммита средств,
                                     # именно ради recovery после краша в этом окне.
-                                    await db.save_open_trade(
-                                        opp, reality.planned_size_usdt, opp.category
-                                    )
+                                    # Шаг 1.0: эта ветка - для НЕ удерживающего
+                                    # трейдера (spot vs spot, is_holding_trader
+                                    # == False), где OpenPair не создаётся вовсе.
+                                    # Поэтому здесь пишем по старой схеме:
+                                    # save_open_trade() теперь принимает пару, а
+                                    # не Opportunity. Для cash-and-carry запись
+                                    # идёт выше, из trader.open_pairs[opp.symbol].
+                                    await db.save_flat_open_trade(
+                                        opp, reality.planned_size_usdt,
+                                        opp.category)
                                     replay.record_decision(
                                         opp, "executed", "ok",
                                         planned_size_usdt=reality.planned_size_usdt,

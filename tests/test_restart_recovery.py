@@ -25,10 +25,23 @@ def _trader():
 
 
 def _db_row(**over):
-    """Ровно те поля, которые отдаёт Database.get_open_trades()."""
-    row = {"id": 1, "symbol": SYM, "buy_ex": "mexc", "sell_ex": "bybit",
+    """Ровно те поля, которые отдаёт Database.get_open_trades().
+
+    Шаг 1.0: здесь добавились ts и поля пары. Раньше фикстура их не
+    содержала - и это было прямой причиной того, что пропущенный ключ ts
+    в get_open_trades() НЕ ЛОВИЛСЯ тестами: тест подставлял данные руками
+    и проверял их же. Зелёный тест при сломанном коде.
+
+    ts теперь обязателен: без него пару восстановить нельзя (см.
+    restore_open), и фикстура должна это отражать.
+    """
+    row = {"id": 1, "ts": int(time.time()) - 3600, "symbol": SYM,
+           "buy_ex": "mexc", "sell_ex": "bybit",
            "size_usdt": 100.0, "buy_price": 100.0, "sell_price": 105.0,
-           "category": "other"}
+           "category": "other",
+           "hold_hours": 2.0, "fut_reserved": 100.5, "amount": 1.0,
+           "entry_basis": 5.0, "direction": "fut_premium",
+           "fees_paid": 0.1, "funding_paid": 0.0}
     row.update(over)
     return row
 

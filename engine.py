@@ -3294,33 +3294,83 @@ class SpotFuturesPaperTrader(PaperTrader):
                 amount = size / entry_spot
                 basis = (entry_fut - entry_spot) / entry_spot * 100.0
                 known = {f.name for f in _dc.fields(OpenPair)}
+
+                # Шаг 1.0: ts - это НЕ "сейчас". Раньше здесь стояло
+                # `or time.time()`, а get_open_trades() ключ ts не
+                # возвращал, поэтому ВСЕ пары восстанавливались с
+                # возрастом 0. Практический эффект был измерим: пара
+                # EGLD/USDT была открыта 4.4 ч при таймауте 4 ч, но
+                # после рестарта её возраст снова становился 0 и она
+                # жила ещё 4 ч. Прогон рисовался по артефакту рестарта.
+                # Теперь отсутствие ts - повод не восстанавливать пару
+                # молча, а сказать об этом прямо.
+                raw_ts = r.get("ts") or r.get("opened_at")
+                if not raw_ts:
+                    logger.error(
+                        f"restore_open: {sym} - в записи нет ts, "
+                        f"таймаут восстановить нельзя. Пропуск пары "
+                        f"(восстановление с нулевым возрастом хуже, чем "
+                        f"потеря пары: первое тихо искажает результаты "
+                        f"прогона)")
+                    continue
+                opened_at = float(raw_ts)
+
                 payload = {
                     "symbol": sym,
                     "buy_exchange": r.get("buy_exchange") or r.get("buy_ex"),
                     "sell_exchange": r.get("sell_exchange") or r.get("sell_ex"),
-                    "direction": "fut_premium" if basis > 0 else "fut_discount",
-                    "amount": amount,
+                    # Направление берём из БД, если есть; иначе - по знаку
+                    # базиса на входе (не по текущим ценам рынка).
+                    "direction": (r.get("direction")
+                                  or ("fut_premium" if basis > 0
+                                      else "fut_discount")),
+                    # amount: приоритет у сохранённого значения. Раньше
+                    # он всегда считался как size/entry_spot, что при
+                    # нулевой цене входа давало 0 - позиция "замораживалась".
+                    "amount": (float(r.get("amount") or 0)
+                               or amount),
                     "size_usdt": size,
                     "entry_spot": entry_spot,
                     "entry_fut": entry_fut,
-                    "entry_basis": basis,
-                    "opened_at": float(r.get("opened_at")
-                                       or r.get("ts") or time.time()),
+                    "entry_basis": float(r.get("entry_basis") or 0) or basis,
+                    "opened_at": opened_at,
                     "margin": size,
-                    "hold_hours": float(r.get("hold_hours")
-                                        or PAPER_HOLD_HOURS_MAX),
+                    # Таймаут ПАРЫ, а не дефолт трейдера: без него
+                    # правило "hold_hours фиксируется по базису" не
+                    # переживало рестарт.
+                    "hold_hours": (float(r.get("hold_hours") or 0)
+                                   or PAPER_HOLD_HOURS_MAX),
+                    # Точный резерв на фьючерсе. Без него после рестарта
+                    # резерв считался от margin, а освобождался от
+                    # margin + fee + funding, и разница навсегда оставалась
+                    # в резерве - тихая утечка баланса.
+                    "fut_reserved": float(r.get("fut_reserved") or 0) or size,
+                    "fees_paid": float(r.get("fees_paid") or 0),
+                    "funding_paid": float(r.get("funding_paid") or 0),
                 }
-                self.open_pairs[sym] = OpenPair(
+                pair = OpenPair(
                     **{k: v for k, v in payload.items() if k in known})
+                self.open_pairs[sym] = pair
                 n += 1
+
+                # Построчная диагностика: видно, что именно вернулось.
+                held_h = (time.time() - opened_at) / 3600.0
+                overdue = " ПЕРЕЖИЛА ТАЙМАУТ!" if held_h > pair.hold_hours else ""
+                logger.info(
+                    f"♻️ {sym} {pair.buy_exchange}→{pair.sell_exchange} "
+                    f"$%s открыто {held_h:.2f}ч назад, "
+                    f"таймаут {pair.hold_hours:.1f}ч, "
+                    f"резерв ${pair.fut_reserved:.2f}, "
+                    f"базис {pair.entry_basis:.2f}%%%s"
+                    % (f"{size:.0f}", overdue))
             except Exception as e:
                 logger.error(f"restore_open: {r.get('symbol')} — {e}")
         if n:
             logger.warning(
-                f"ВОССТАНОВЛЕНО {n} открытых арбитражных пар. Их таймауты "
-                f"считаются от момента открытия, а не от рестарта, поэтому "
-                f"пара, открытая более {PAPER_HOLD_HOURS_MAX}ч назад, закроется "
-                f"на первом же цикле.")
+                f"ВОССТАНОВЛЕНО {n} открытых арбитражных пар. Таймауты "
+                f"считаются от момента ОТКРЫТИЯ (ts из БД), а не от "
+                f"рестарта. Пара, открытая дольше своего таймаута, "
+                f"закроется на первом же цикле.")
         return n
 
     def _opp_stub(self, p: OpenPair) -> "Opportunity":
@@ -3505,6 +3555,34 @@ class Database:
             ("size_usdt", "REAL"),
             ("buy_price", "REAL DEFAULT 0"),
             ("sell_price", "REAL DEFAULT 0"),
+            # ── Шаг 1.0: поля, без которых восстановление неполно ──
+            # hold_hours: таймаут ФИКСИРУЕТСЯ на паре при открытии по
+            # размеру базиса (BasisEntryCriteria.hold_hours_for). Без
+            # колонки restore_open() падал в PAPER_HOLD_HOURS_MAX, то
+            # есть правило "срок принадлежит паре" не переживало рестарт.
+            ("hold_hours", "REAL DEFAULT 4.0"),
+            # fut_reserved: ТОЧНАЯ сумма резерва на фьючерсной бирже
+            # (margin + входная комиссия). Без неё резерв на закрытии
+            # считался от margin, а освобождался от margin + fee +
+            # funding - разница навсегда оставалась в резерве.
+            ("fut_reserved", "REAL DEFAULT 0"),
+            # amount: количество базового актива. Восстанавливается из
+            # size_usdt/entry_spot, но при нулевой цене входа это 0, и
+            # пара осталась бы с нулевой позицией - "замороженные" funds.
+            ("amount", "REAL DEFAULT 0"),
+            # entry_basis: базис на входе, %. Нужен, чтобы после
+            # рестарта понимать направление (премиум/дисконт) и не
+            # пересчитывать его по текущим ценам.
+            ("entry_basis", "REAL DEFAULT 0"),
+            # direction: "fut_premium"/"fut_discount" - та же причина.
+            ("direction", "TEXT"),
+            # margin: размер резерва фьючерсной ноги на входе.
+            ("margin", "REAL DEFAULT 0"),
+            # fees_paid / funding_paid: накопленные расходы пары. Без
+            # них после рестарта PnL считается без уже уплаченного, и
+            # итог по фандингу занижается.
+            ("fees_paid", "REAL DEFAULT 0"),
+            ("funding_paid", "REAL DEFAULT 0"),
         ):
             try:
                 self.conn.execute(
@@ -3647,17 +3725,70 @@ class Database:
              opp.confidence_score, opp.category, opp.max_safe_size_usdt)
         ))
     
-    async def save_open_trade(self, opp: Opportunity, size_usdt: float, category: str = "other"):
-        """Запись о начале сделки. После execute, до close."""
-        buy_price = opp.buy_price or 0
-        sell_price = opp.sell_price or 0
+    async def save_flat_open_trade(self, opp: Opportunity, size_usdt: float,
+                                   category: str = "other"):
+        """Запись мгновенной (spot vs spot) сделки - БЕЗ пары.
+
+        Шаг 1.0. Для трейдера без удержания OpenPair не существует: сделка
+        открывается и закрывается в одном execute(). Такие пары и не
+        восстанавливаются - восстанавливать нечего, к моменту рестарта их
+        уже нет. Поэтому здесь достаточно старой схемы, и отделять её от
+        save_open_trade() правильно: у cash-and-carry поля пары обязательны,
+        а здесь их взять неоткуда.
+        """
         await self.queue.put((
-            "INSERT INTO trades (ts, symbol, pnl, pnl_pct, balance, category, "
-            "status, buy_ex, sell_ex, size_usdt, buy_price, sell_price) "
-            "VALUES (?,?,0,0,0,?, 'open',?,?,?,?,?)",
+            "INSERT INTO trades (ts, symbol, pnl, pnl_pct, balance, "
+            "category, status, buy_ex, sell_ex, size_usdt, buy_price, "
+            "sell_price) VALUES (?,?,0,0,0,?, 'open',?,?,?,?,?)",
             (int(time.time()), opp.symbol, category,
              opp.buy_exchange, opp.sell_exchange, size_usdt,
-             buy_price, sell_price)
+             float(opp.buy_price or 0), float(opp.sell_price or 0))
+        ))
+
+    async def save_open_trade(self, pair: "OpenPair", category: str = "other"):
+        """Запись открытой пары - САМОЙ ПАРЫ, а не Opportunity.
+
+        Шаг 1.0. Раньше сигнатура была (opp, size_usdt, category), и
+        писались opp.buy_price / opp.sell_price. Это расчётные цены
+        ВОЗМОЖНОСТИ, а не фактические цены исполненной ноги, и вместе с
+        ними терялись поля самой пары: hold_hours (таймаут), fut_reserved
+        (резерв), amount (объём позиции), entry_basis (направление).
+        Всё это физически негде было взять при восстановлении.
+
+        Теперь источник истины - OpenPair, уже созданная трейдером, и
+        тесты могут проверить точный круг: записали пару, перечитали из
+        БД, восстановили и сравняли поля.
+
+        category оставлен параметром по умолчанию: он приходит из
+        Opportunity (там он точно есть), а в OpenPair такого поля нет.
+        """
+        await self.queue.put((
+            # Счёт колонок и значений проверяется тестом
+            # test_insert_columns_match_placeholders: список колонок и
+            # VALUES должны совпадать по длине. Ошибка такого рода
+            # ("19 values for 20 columns") не видна в коде - только в
+            # логе воркера, и запись молча не происходит.
+            "INSERT INTO trades (ts, symbol, pnl, pnl_pct, balance, "
+            "category, status, buy_ex, sell_ex, size_usdt, buy_price, "
+            "sell_price, margin, hold_hours, fut_reserved, amount, "
+            "entry_basis, direction, fees_paid, funding_paid) "
+            "VALUES (?,?,0,0,0,?, 'open',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (int(pair.opened_at or time.time()),
+             pair.symbol,
+             category,
+             pair.buy_exchange,
+             pair.sell_exchange,
+             float(pair.size_usdt or 0),
+             float(pair.entry_spot or 0),
+             float(pair.entry_fut or 0),
+             float(pair.margin or 0),
+             float(pair.hold_hours or PAPER_HOLD_HOURS_MAX),
+             float(pair.fut_reserved or 0),
+             float(pair.amount or 0),
+             float(pair.entry_basis or 0),
+             pair.direction or "",
+             float(pair.fees_paid or 0),
+             float(pair.funding_paid or 0))
         ))
     
     async def close_trade(self, symbol: str, buy_ex: str, sell_ex: str,
@@ -3670,24 +3801,61 @@ class Database:
         ))
     
     async def get_open_trades(self) -> List[Dict]:
-        """Для recovery при старте."""
+        """Открытые пары со ВСЕМИ полями, нужными для восстановления.
+
+        Шаг 1.0, найдено чтением кода. Здесь был список колонок без `ts`,
+        а restore_open() читает r.get("ts") - ключа просто не было в
+        словаре, поэтому срабатывал `or time.time()` и ВСЕ восстановленные
+        пары получали возраст 0. Практический эффект: пара с таймаутом 4 ч,
+        открытая 4.4 ч назад, после перезапуска жила ещё 4 ч. Итог прогона
+        рисовался по артефакту рестарта, а не по стратегии.
+
+        Теперь читаем явно и по именам (sqlite3.Row), чтобы добавление
+        колонки в SELECT не сдвигало позиционные индексы.
+        """
         if not self.conn:
             return []
         try:
+            self.conn.row_factory = sqlite3.Row
             cur = self.conn.execute(
-                "SELECT id, ts, symbol, buy_ex, sell_ex, size_usdt, "
-                "buy_price, sell_price, category FROM trades WHERE status='open'"
+                "SELECT id, ts, symbol, category, status, buy_ex, sell_ex, "
+                "size_usdt, buy_price, sell_price, "
+                "margin, "
+                "hold_hours, fut_reserved, amount, entry_basis, direction, "
+                "fees_paid, funding_paid "
+                "FROM trades WHERE status='open'"
             )
             rows = cur.fetchall()
-            return [
-                {"id": r[0], "symbol": r[2], "buy_ex": r[3], "sell_ex": r[4],
-                 "size_usdt": r[5], "buy_price": r[6], "sell_price": r[7],
-                 "category": r[8]}
-                for r in rows
-            ]
+            out = []
+            for r in rows:
+                d = dict(r)
+                # Старые строки (до миграции Шага 1.0) не имеют новых
+                # колонок - они придут как None. Приводим к безопасным
+                # значениям ЗДЕСЬ, чтобы restore_open() получал числа,
+                # а не None, иначе арифметика падала бы на закрытии.
+                if d.get("ts") is None:
+                    logger.warning(
+                        f"⚠️ trades id={d.get('id')} {d.get('symbol')}: "
+                        f"ts пуст - таймаут этой пары не восстановится")
+                d["size_usdt"] = float(d.get("size_usdt") or 0)
+                d["buy_price"] = float(d.get("buy_price") or 0)
+                d["sell_price"] = float(d.get("sell_price") or 0)
+                for k in ("hold_hours", "fut_reserved", "amount", "margin",
+                          "entry_basis", "fees_paid", "funding_paid"):
+                    d[k] = float(d.get(k) or 0)
+                out.append(d)
+            return out
         except Exception as e:
             logger.warning(f"DB get_open_trades: {e}")
             return []
+        finally:
+            # row_factory - глобальное свойство соединения: если оставить
+            # sqlite3.Row, ломаются все остальные запросы, которые ждут
+            # позиционные индексы (r[0], r[1] ...).
+            try:
+                self.conn.row_factory = None
+            except Exception:
+                pass
     
     async def save_trade(self, trade: TradeResult, category: str = "other"):
         """Legacy — полная запись для уже закрытой сделки (status='closed')."""
