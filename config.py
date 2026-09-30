@@ -10,13 +10,32 @@ TRADING_MODE = os.getenv("TRADING_MODE", "paper")
 PAPER_BALANCE = float(os.getenv("PAPER_BALANCE", "10000"))
 PAPER_EXECUTION_MODEL = os.getenv("PAPER_EXECUTION_MODEL", "spot_futures")
 
+# Биржи (Шаг 0.5, 2026-09-30).
+#
+# Расширено с bybit+mexc. Основание - измерение узких пар, где спред
+# меньше 0.3% на ОБЕИХ ногах (торгуемые):
+#     mexc  <-> gate     511
+#     kucoin<-> gate     428
+#     mexc  <-> kucoin   349
+#     okx   <-> gate     251
+#     mexc  <-> okx      231
+# Против 507 пар на mexc<->bybit - рост в 8.5 раз.
+#
+# htx ИСКЛЮЧЁН сознательно: медиана спреда 1.52%, p90 = 18.75%,
+# p99 = 63.45%. Расход растёт 1:1 со спредом, а базис выше 3.4% не
+# встречается - торговать там нечего, кроме убытка.
 EXCHANGES = [
-    "bybit", "mexc"
+    "bybit", "mexc", "kucoin", "okx", "gate"
 ]
 
+# Конкурентность одновременных запросов per-exchange (семафоры в
+# ExchangePool). Значения по фактическим ответам API.
 RATE_LIMITS = {
-    "bybit": 10, 
-    "mexc": 15
+    "bybit": 10,
+    "mexc": 15,
+    "kucoin": 8,
+    "okx": 8,
+    "gate": 8,
 }
 
 TRADING_FEES = {
