@@ -2794,3 +2794,281 @@ class SpotFuturesPaperTrader(PaperTrader):
             logger.critical(
                 f"CLOSE FAILED {p.symbol}: {e} — возможен рассинхрон ног, "
                 f"нужна ручная сверка")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# ВОССТАНОВЛЕНО 2026-09-30 (Шаг 0.0)
+#
+# Hunter, Telegram и Database были потеряны при пересборке engine.py и
+# восстановлены из old/Новая папка (7)/engine.py, строки 2236-2494.
+# app.py импортирует их из engine (строки 19-29), поэтому без них модуль
+# не поднимался: ImportError: cannot import name 'Hunter'.
+#
+# Блок перенесён БЕЗ ИЗМЕНЕНИЙ. Прежде чем править поведение, сверься с
+# вызовами в app.py:
+#   hunter.select(volumes)
+#   tg.start / tg.send / tg.stop
+#   db.start / db.stop / db.save_opportunity / db.save_open_trade /
+#      db.close_trade / db.get_open_trades / db.save_trade /
+#      db.save_portfolio_state / db.load_portfolio_state /
+#      db.delete_portfolio_state
+# ═══════════════════════════════════════════════════════════════════════# ════════════════════════════════════════════════
+class Hunter:
+    def __init__(self, pool: ExchangePool):
+        self.pool = pool
+    
+    def select(self, volumes: Dict[str, Dict[str, float]]) -> List[str]:
+        candidates = []
+        for symbol, exchanges in self.pool.symbols_per_exchange.items():
+            count = len(exchanges)
+            if not (MIN_EXCHANGES <= count <= MAX_EXCHANGES):
+                continue
+            base = symbol.split("/")[0]
+            if base in BLACKLIST:
+                continue
+            vols = [volumes.get(symbol, {}).get(ex, 0) for ex in exchanges]
+            vols = [v for v in vols if v > 0]
+            if not vols:
+                continue
+            vols.sort()
+            median_vol = vols[len(vols) // 2]
+            if not (MIN_VOLUME_USDT <= median_vol <= MAX_VOLUME_USDT):
+                continue
+            score = count * 1_000_000 + math.log10(max(median_vol, 1)) * 100_000
+            candidates.append((symbol, score, median_vol, count))
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        return [c[0] for c in candidates[:MAX_SYMBOLS]]
+
+
+# ════════════════════════════════════════════════
+# TELEGRAM
+# ════════════════════════════════════════════════
+class Telegram:
+    def __init__(self):
+        self.enabled = bool(TG_TOKEN and TG_CHAT)
+        self.queue: Optional[asyncio.Queue] = None
+        self.session: Optional[aiohttp.ClientSession] = None
+        self._task: Optional[asyncio.Task] = None
+    
+    async def start(self):
+        if not self.enabled:
+            return
+        self.session = aiohttp.ClientSession()
+        self.queue = asyncio.Queue()
+        self._task = asyncio.create_task(self._worker())
+    
+    async def stop(self):
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        if self.session:
+            await self.session.close()
+    
+    async def _worker(self):
+        while True:
+            try:
+                msg = await self.queue.get()
+                url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+                await self.session.post(url, json={
+                    "chat_id": TG_CHAT, "text": msg[:4000], "parse_mode": "HTML"
+                })
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"Telegram: {e}")
+    
+    async def send(self, text: str):
+        if self.enabled and self.queue:
+            await self.queue.put(text)
+
+
+# ════════════════════════════════════════════════
+# DATABASE
+# ════════════════════════════════════════════════
+class Database:
+    def __init__(self):
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self._writer_task: Optional[asyncio.Task] = None
+        self.conn: Optional[sqlite3.Connection] = None
+    
+    async def start(self):
+        self._writer_task = asyncio.create_task(self._writer())
+        await asyncio.sleep(0.1)
+    
+    async def _writer(self):
+        self.conn = sqlite3.connect("hunter.db", check_same_thread=False)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS opportunities (
+                id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT,
+                buy_ex TEXT, sell_ex TEXT, spread REAL, net REAL,
+                vol REAL, confidence REAL, category TEXT,
+                max_safe_size REAL
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY, ts INTEGER, symbol TEXT,
+                pnl REAL, pnl_pct REAL, balance REAL, category TEXT,
+                status TEXT DEFAULT 'open',
+                buy_ex TEXT, sell_ex TEXT, size_usdt REAL,
+                buy_price REAL DEFAULT 0, sell_price REAL DEFAULT 0
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS portfolio_state (
+                key TEXT PRIMARY KEY, value REAL
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS exchange_balances (
+                exchange TEXT, asset TEXT, amount REAL,
+                PRIMARY KEY (exchange, asset)
+            )
+        """)
+        self.conn.commit()
+        while True:
+            try:
+                query, args = await self.queue.get()
+                self.conn.execute(query, args)
+                self.conn.commit()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"DB: {e}")
+    
+    async def save_opportunity(self, opp: Opportunity):
+        await self.queue.put((
+            "INSERT INTO opportunities VALUES (NULL,?,?,?,?,?,?,?,?,?,?)",
+            (opp.timestamp, opp.symbol, opp.buy_exchange, opp.sell_exchange,
+             opp.spread_pct, opp.net_profit_pct, opp.volume,
+             opp.confidence_score, opp.category, opp.max_safe_size_usdt)
+        ))
+    
+    async def save_open_trade(self, opp: Opportunity, size_usdt: float, category: str = "other"):
+        """Запись о начале сделки. После execute, до close."""
+        buy_price = opp.buy_price or 0
+        sell_price = opp.sell_price or 0
+        await self.queue.put((
+            "INSERT INTO trades (ts, symbol, pnl, pnl_pct, balance, category, "
+            "status, buy_ex, sell_ex, size_usdt, buy_price, sell_price) "
+            "VALUES (?,?,0,0,0,?, 'open',?,?,?,?,?)",
+            (int(time.time()), opp.symbol, category,
+             opp.buy_exchange, opp.sell_exchange, size_usdt,
+             buy_price, sell_price)
+        ))
+    
+    async def close_trade(self, symbol: str, buy_ex: str, sell_ex: str,
+                           pnl: float, pnl_pct: float, balance_after: float):
+        """Закрытие сделки — UPDATE статус по symbol + path."""
+        await self.queue.put((
+            "UPDATE trades SET status='closed', pnl=?, pnl_pct=?, balance=? "
+            "WHERE symbol=? AND buy_ex=? AND sell_ex=? AND status='open'",
+            (pnl, pnl_pct, balance_after, symbol, buy_ex, sell_ex)
+        ))
+    
+    async def get_open_trades(self) -> List[Dict]:
+        """Для recovery при старте."""
+        if not self.conn:
+            return []
+        try:
+            cur = self.conn.execute(
+                "SELECT id, ts, symbol, buy_ex, sell_ex, size_usdt, "
+                "buy_price, sell_price, category FROM trades WHERE status='open'"
+            )
+            rows = cur.fetchall()
+            return [
+                {"id": r[0], "symbol": r[2], "buy_ex": r[3], "sell_ex": r[4],
+                 "size_usdt": r[5], "buy_price": r[6], "sell_price": r[7],
+                 "category": r[8]}
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning(f"DB get_open_trades: {e}")
+            return []
+    
+    async def save_trade(self, trade: TradeResult, category: str = "other"):
+        """Legacy — полная запись для уже закрытой сделки (status='closed')."""
+        await self.queue.put((
+            "INSERT INTO trades (ts, symbol, pnl, pnl_pct, balance, category, "
+            "status, buy_ex, sell_ex, size_usdt, buy_price, sell_price) "
+            "VALUES (?,?,?,?,?,?, 'closed',?,?,?,?,?)",
+            (trade.timestamp, trade.symbol, trade.pnl, trade.pnl_pct,
+             trade.balance_after, category,
+             trade.buy_exchange, trade.sell_exchange, trade.amount,
+             trade.buy_exchange and 0, trade.sell_exchange and 0)
+        ))
+    
+    async def stop(self):
+        if self._writer_task:
+            self._writer_task.cancel()
+            try:
+                await self._writer_task
+            except asyncio.CancelledError:
+                pass
+        if self.conn:
+            self.conn.close()
+
+    async def save_portfolio_state(self, portfolio: "Portfolio", balance_manager: Optional["BalanceManager"] = None):
+        """Сохраняет баланс и per-exchange балансы для восстановления."""
+        await self.queue.put((
+            "INSERT OR REPLACE INTO portfolio_state (key, value) VALUES (?,?)",
+            ("balance", portfolio.balance)
+        ))
+        await self.queue.put((
+            "INSERT OR REPLACE INTO portfolio_state (key, value) VALUES (?,?)",
+            ("initial_balance", portfolio.initial_balance)
+        ))
+        await self.queue.put((
+            "INSERT OR REPLACE INTO portfolio_state (key, value) VALUES (?,?)",
+            ("peak_equity", portfolio.peak_equity)
+        ))
+        await self.queue.put((
+            "INSERT OR REPLACE INTO portfolio_state (key, value) VALUES (?,?)",
+            ("total_trades", float(len(portfolio.closed_trades)))
+        ))
+        if balance_manager:
+            await self.queue.put(("DELETE FROM exchange_balances", ()))
+            for ex, assets in balance_manager.balances.items():
+                for asset, amount in assets.items():
+                    await self.queue.put((
+                        "INSERT OR REPLACE INTO exchange_balances VALUES (?,?,?)",
+                        (ex, asset, amount)
+                    ))
+
+    async def load_portfolio_state(self) -> Tuple[Optional[float], Optional[float], Optional[float], Dict]:
+        """Загружает сохранённое состояние портфеля.
+        
+        Returns:
+            (balance, initial_balance, peak_equity, exchange_balances)
+        """
+        if not self.conn:
+            return None, None, None, {}
+        try:
+            cur = self.conn.execute("SELECT key, value FROM portfolio_state")
+            state = dict(cur.fetchall())
+            balance = state.get("balance")
+            initial_balance = state.get("initial_balance")
+            peak_equity = state.get("peak_equity")
+            
+            cur2 = self.conn.execute("SELECT exchange, asset, amount FROM exchange_balances")
+            ex_balances = {}
+            for ex, asset, amount in cur2.fetchall():
+                ex_balances.setdefault(ex, {})[asset] = amount
+            
+            return balance, initial_balance, peak_equity, ex_balances
+        except Exception as e:
+            logger.warning(f"DB load_portfolio_state: {e}")
+            return None, None, None, {}
+
+    async def delete_portfolio_state(self):
+        """Очищает сохранённое состояние (после успешного восстановления)."""
+        try:
+            self.conn.execute("DELETE FROM portfolio_state")
+            self.conn.execute("DELETE FROM exchange_balances")
+            self.conn.commit()
+        except Exception as e:
+            logger.warning(f"DB delete_portfolio_state: {e}")
