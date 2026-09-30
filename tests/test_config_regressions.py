@@ -54,13 +54,21 @@ def test_all_configured_exchanges_have_fees():
 
 def test_fee_is_symmetric_across_route():
     """
+    Комиссия маршрута симметрична: bybit<->mexc == mexc<->bybit.
+
     Раньше bybit<->mexc стоил 0.1%, а bybit<->bybit 0.2% — маршрут выбирался
-    по комиссии, а не по спреду. Теперь все маршруты стоят одинаково.
+    по комиссии, а не по спреду. Теперь стоимость зависит только от набора
+    бирж в маршруте, порядок не важен.
+
+    После подключения gate (0.15%) абсолютные ставки УЖЕ НЕ одинаковы:
+    0.10+0.10 = 0.002 против 0.15+0.15 = 0.0025. Это нормально и учтено
+    в BasisEntryCriteria, который берёт комиссии по биржам из тикеров.
+    Проверяется симметричность, а не равенство всех маршрутов.
     """
     fees = {(a, b): C.TRADING_FEES[a] + C.TRADING_FEES[b]
             for a in C.EXCHANGES for b in C.EXCHANGES if a != b}
-    assert len(set(round(v, 6) for v in fees.values())) == 1, \
-        f"комиссии маршрутов различаются: {fees}"
+    asym = [(ab, v) for ab, v in fees.items() if fees.get((ab[1], ab[0])) != v]
+    assert not asym, f"комиссия несимметрична по маршруту: {asym}"
 
 
 # ==========================================
