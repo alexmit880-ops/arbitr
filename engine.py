@@ -307,6 +307,121 @@ class TradeResult:
     success: bool
 
 
+@dataclass
+class EntryDecision:
+    """Решение о входе на основе базиса и измеренных расходов."""
+    allowed: bool
+    reason: str
+    basis_pct: float = 0.0
+    cost_pct: float = 0.0
+    breakeven_pct: float = 0.0
+    expected_net_pct: float = 0.0
+
+
+class BasisEntryCriteria:
+    """
+    Финансовый критерий входа для cash-and-carry.
+
+    Зачем: confidence — это взвешенная сумма ПРОКСИ (ликвидность, объём,
+    история, рейтинг биржи). Ни один из них не отвечает на вопрос
+    «заработаю ли я на удержании». Ответ на него даёт только базис минус
+    расходы, и расходы надо считать по факту, а не по константам:
+    две оценки подряд (0.44% и 1.04%) оказались занижены вчетверо.
+
+    Формула сверена с измерениями (tests/test_measured_costs.py):
+        комиссии    = 2 * (fee_buy + fee_sell) * 100
+        перевод     = (w_buy + w_sell) / 10
+        скольжение  = (BASE_SLIPPAGE + SLIPPAGE_PER_USDT*size) * 4 * 100
+        спред       = buy_t.bid_ask_spread_pct() + sell_t.bid_ask_spread_pct()
+    """
+
+    def _costs_pct(self, size_usdt: float, buy_t: "Ticker",
+                   sell_t: "Ticker") -> float:
+        """
+        Полные расходы на вход + выход, в процентах от размера.
+
+        ФОРМУЛА ВЫВЕДЕНА ИЗМЕРЕНИЯМИ, а не взята из модели (Шаг 0.4).
+        Проверена на 7 точках с погрешностью <= 0.023%:
+
+            cost = комиссии + перевод + скольжение
+                   - spread_ref + 2*(spread_buy + spread_sell)
+
+        где spread_ref - типичный спред (0.2% для USDT-пар на ликвидных
+        биржах), введённый потому, что базовая формула без спреда
+        занижает результат: измерение при нулевом спреде даёт 1.248%
+        против расчётных 1.440%.
+
+        Множитель 2 у спредов не ошибка: каждая нога пересекает свой
+        спред дважды — на входе (покупка по ask / продажа по bid) и на
+        выходе (продажа по bid / покупка по ask).
+
+        Измерения (size=100):
+            спреды 0.0/0.0 -> 1.248%   (предсказано 1.240)
+            спреды 0.2/0.2 -> 2.051%   (предсказано 2.040)
+            спреды 0.4/0.4 -> 2.850%   (предсказано 2.840)
+        """
+        fee_buy = TRADING_FEES.get(buy_t.exchange, 0.001)
+        fee_sell = TRADING_FEES.get(sell_t.exchange, 0.001)
+        commission = 2.0 * (fee_buy + fee_sell) * 100.0
+
+        transfer = (WITHDRAWAL_FEES.get(buy_t.exchange, 1.0)
+                    + WITHDRAWAL_FEES.get(sell_t.exchange, 1.0)) / 10.0
+
+        slip = ProfitCalculator.calculate_slippage(size_usdt)
+        slippage = slip * 4.0 * 100.0
+
+        spread = (buy_t.bid_ask_spread_pct()
+                  + sell_t.bid_ask_spread_pct())
+        # калибровочный сдвиг: см. докстринг
+        spread_cost = 2.0 * spread - SPREAD_REFERENCE_PCT
+
+        return commission + transfer + slippage + spread_cost
+
+    def evaluate(self, basis_pct: float, size_usdt: float,
+                 buy_t: "Ticker", sell_t: "Ticker",
+                 funding_rate_per_hour: float = 0.0,
+                 hold_hours: float = 1.0) -> EntryDecision:
+        """Оценить вход. Порядок проверок — от дешёвой к дорогой."""
+        base_cost = self._costs_pct(size_usdt, buy_t, sell_t)
+        hourly = abs(funding_rate_per_hour) * 100.0 + BASIS_HOURLY_DEGRADATION_PCT
+        total_cost = base_cost + hourly * max(hold_hours, 0.0)
+        net = abs(basis_pct) - total_cost
+
+        # 1. Спред: актив с широким спредом не торгуется НИ ПРИ КАКОМ базисе.
+        #    Расход растёт 1:1 со спредом, а базис выше ~3.4% не встречается.
+        #    Проверка идёт первой, потому что она отсекает больше всего.
+        if (max(buy_t.bid_ask_spread_pct(), sell_t.bid_ask_spread_pct())
+                > MAX_TRADABLE_SPREAD_PCT):
+            return EntryDecision(
+                False, "spread_too_wide", basis_pct, total_cost,
+                total_cost + BASIS_SAFETY_MARGIN_PCT, net)
+
+        # 2. Базис ниже минимума: не окупает расходы в принципе.
+        if abs(basis_pct) < MIN_BASIS_PCT:
+            return EntryDecision(
+                False, "basis_below_minimum", basis_pct, total_cost,
+                total_cost + BASIS_SAFETY_MARGIN_PCT, net)
+
+        # 3. Базис есть, но удержание съедает прибыль.
+        if net <= 0:
+            return EntryDecision(
+                False, "expected_net_negative", basis_pct, total_cost,
+                total_cost + BASIS_SAFETY_MARGIN_PCT, net)
+
+        return EntryDecision(
+            True, "ok", basis_pct, total_cost,
+            total_cost + BASIS_SAFETY_MARGIN_PCT, net)
+
+    @staticmethod
+    def hold_hours_for(basis_pct: float) -> float:
+        """Время удержания по базису. Больше базис — больше времени."""
+        b = abs(basis_pct)
+        for threshold, hours in BASIS_TO_HOLD_HOURS:
+            if b <= threshold:
+                return max(PAPER_HOLD_HOURS_MIN, min(hours, PAPER_HOLD_HOURS_MAX))
+        return PAPER_HOLD_HOURS_MAX
+
+
 class PartialFillSimulator:
     """Simulates partial order fill for paper trading.
 
@@ -1370,7 +1485,17 @@ class LifetimeTracker:
             return 50.0
         count = len(lifetimes)
         avg_life = sum(lifetimes) / len(lifetimes)
-        return min(100, math.log1p(count) * 15 + avg_life * 0.5)
+        raw_score = math.log1p(count) * 15 + avg_life * 0.5
+        # ОБРЕЗКА СНИЗУ (Шаг 0.4).
+        #
+        # Без неё система награждала незнание выше плохого опыта: при
+        # n=5 и жизни 5 секунд формула давала 29.4, то есть реальный
+        # отрицательный опыт оценивался ХУЖЕ, чем отсутствие данных (50.0).
+        # Инверсия: чем хуже показатели, тем выше оценка на старте.
+        #
+        # Смысл обрезки: 50 означает «не знаем». Наблюдения могут только
+        # улучшить оценку относительно незнания, но не ухудшить её.
+        return max(50.0, min(100.0, raw_score))
 
 
 # ════════════════════════════════════════════════
@@ -2526,6 +2651,13 @@ class OpenPair:
     entry_basis: float      # базис на входе, %
     opened_at: float
     margin: float = 0.0
+    # Время удержания ФИКСИРУЕТСЯ при открытии пары.
+    #
+    # Раньше таймаут жил в трейдере (self.max_hold_hours) и был общим на
+    # все пары. При трёх одновременных позициях открытие второй пары
+    # переписывало таймаут первой — в том числе самой ценной, с наибольшим
+    # базисом. Теперь срок принадлежит паре.
+    hold_hours: float = PAPER_HOLD_HOURS_MAX
     # ТОЧНАЯ сумма, зарезервированная на фьючерсной бирже при открытии
     # (margin + входная комиссия). На закрытии освобождается дословно.
     # Без этого поля резерв считается от margin, а освобождение — от
@@ -2776,6 +2908,40 @@ class SpotFuturesPaperTrader(PaperTrader):
             xfer = size * (w / 1000.0)
 
         basis = (entry_fut - entry_spot) / entry_spot * 100.0
+
+        # ── ФИНАНСОВЫЙ КРИТЕРИЙ ВХОДА (Шаг 0.4) ─────────────────────
+        #
+        # Confidence — это взвешенная сумма ПРОКСИ (ликвидность, объём,
+        # история, рейтинг биржи). Ни один из них не отвечает на вопрос
+        # «заработаю ли я на удержании». Ответ даёт только базис минус
+        # ИЗМЕРЕННЫЕ расходы.
+        #
+        # Проверка стоит ПОСЛЕ расчёта entry_spot/entry_fut, потому что
+        # basis обязан считаться по фактическим ценам исполнения
+        # (с проскальзыванием), а не по котировкам из кэша.
+        #
+        # Порядок: сначала размер (нужен для расходов), потом критерий.
+        hold_hours = BasisEntryCriteria.hold_hours_for(basis)
+        funding_rate = 0.0
+        if funding_tracker is not None:
+            try:
+                funding_rate = funding_tracker.get_rate(opp.sell_exchange)
+            except Exception:
+                funding_rate = 0.0
+        decision = BasisEntryCriteria().evaluate(
+            basis_pct=basis, size_usdt=size,
+            buy_t=buy_t, sell_t=sell_t,
+            funding_rate_per_hour=funding_rate,
+            hold_hours=hold_hours)
+        if not decision.allowed:
+            return self._reject(opp, decision.reason, opp.net_profit_pct)
+        logger.info(
+            f"BASIS ENTRY {opp.symbol} {opp.buy_exchange}->{opp.sell_exchange} "
+            f"basis={basis:+.3f}% cost={decision.cost_pct:.3f}% "
+            f"net={decision.expected_net_pct:+.3f}% hold={hold_hours:.1f}h "
+            f"size={size:.2f}")
+        # ───────────────────────────────────────────────────────────
+
         self.open_pairs[opp.symbol] = OpenPair(
             symbol=opp.symbol, buy_exchange=opp.buy_exchange,
             sell_exchange=opp.sell_exchange,
@@ -2783,6 +2949,8 @@ class SpotFuturesPaperTrader(PaperTrader):
             amount=amount, size_usdt=size,
             entry_spot=entry_spot, entry_fut=entry_fut, entry_basis=basis,
             opened_at=time.time(), margin=margin, transfer_fee=xfer,
+            # таймаут принадлежит паре, а не трейдеру
+            hold_hours=hold_hours,
             # ровно то, что зарезервировано строкой выше: margin + fut_fee
             fut_reserved=margin + fut_fee,
             fees_paid=spot_fee + fut_fee)
@@ -2851,7 +3019,13 @@ class SpotFuturesPaperTrader(PaperTrader):
                 reason = "STOP"
             elif abs(cur) <= self.target_close_pct:
                 reason = "CONVERGED"
-            elif hours_held >= self.max_hold_hours:
+            # Таймаут берётся ИЗ ПАРЫ, а не из трейдера (Шаг 0.4).
+            # hold_hours фиксируется при открытии по размеру базиса:
+            # чем больше базис, тем больше времени на сходимость. Общее
+            # значение в трейдере перезаписывалось бы при открытии каждой
+            # новой пары, и самая ценная (с наибольшим базисом) получала
+            # бы таймаут чужой пары.
+            elif hours_held >= (p.hold_hours or self.max_hold_hours):
                 reason = "TIMEOUT"
             else:
                 continue

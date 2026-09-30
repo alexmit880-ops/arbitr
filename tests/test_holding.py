@@ -47,10 +47,17 @@ def trader(**kw):
     return E.SpotFuturesPaperTrader(pf, bm, **d), pf, bm
 
 
+# Цена фьючерса подобрана так, чтобы базис заведомо проходил финансовый
+# критерий входа (BasisEntryCriteria, MIN_BASIS_PCT = 2.0%).
+# При споте 100.2 и фьючерсе 102.2 базис составлял ~1.37%, пара
+# отклонялась с basis_below_minimum, и все тесты жизненного цикла падали.
+FUT_BID, FUT_ASK = 106.0, 106.2
+
+
 def open_pair(t, **kw):
     r = asyncio.run(t.execute(
-        opp(**kw), {"binance": tk(100, 100.2), "bybit": tk(102, 102.2)},
-        futures_prices={SYM: {"bybit": tk(102, 102.2)}}))
+        opp(**kw), {"binance": tk(100, 100.2), "bybit": tk(FUT_BID, FUT_ASK)},
+        futures_prices={SYM: {"bybit": tk(FUT_BID, FUT_ASK)}}))
     assert r is None, "execute() на открытии не должен возвращать TradeResult"
     return r
 
@@ -78,8 +85,8 @@ def test_pnl_is_not_just_the_spread():
     # таймаут делаем заведомо истёкшим: проверяем ИМЕННО расчёт PnL, а не
     # механизм выхода (он покрыт отдельными тестами ниже)
     p = list(t.open_pairs.values())[0]
-    p.opened_at = time.time() - 3600.0
-    closed = step(t, 100, 100.2, 102, 102.2)   # цены те же, базис не сошёлся
+    p.opened_at = time.time() - (p.hold_hours * 3600.0 + 60.0)
+    closed = step(t, 100, 100.2, FUT_BID, FUT_ASK)   # цены те же, базис не сошёлся
     assert len(closed) == 1
     assert closed[0].pnl < (102 - 100), \
         "PnL подозрительно близок к полному спреду — возможно возврат бага"
@@ -99,8 +106,12 @@ def test_timeout_measured_in_hours_not_cycles():
     t, pf, bm = trader(max_hold_hours=0.05)     # 3 минуты
     open_pair(t)
     p = list(t.open_pairs.values())[0]
-    p.opened_at = time.time() - 600.0           # 10 минут > 3
-    closed = step(t, 100, 100.2, 101.0, 101.2)  # базис стабилен, не сошёлся
+    # Таймаут принадлежит ПАРЕ (Шаг 0.4): hold_hours задаётся
+    # по BASIS_TO_HOLD_HOURS, поэтому отступаем на p.hold_hours.
+    p.opened_at = time.time() - (p.hold_hours * 3600.0 + 60.0)
+    # Базис на выходе остаётся высоким (не сходится) - иначе сработает
+    # CONVERGED раньше, чем TIMEOUT, и тест проверял бы не то.
+    closed = step(t, 100, 100.2, 105.0, 105.2)
     assert len(closed) == 1
     assert closed[0].pnl < 0
 
@@ -132,8 +143,8 @@ def test_max_open_pairs_enforced():
     assert len(t.open_pairs) == 1
     asyncio.run(t.execute(
         opp("BTC/USDT"),
-        {"binance": tk(100, 100.2), "bybit": tk(102, 102.2)},
-        futures_prices={"BTC/USDT": {"bybit": tk(102, 102.2)}}))
+        {"binance": tk(100, 100.2), "bybit": tk(FUT_BID, FUT_ASK)},
+        futures_prices={"BTC/USDT": {"bybit": tk(FUT_BID, FUT_ASK)}}))
     assert len(t.open_pairs) == 1, "лимит одновременных пар не соблюдён"
     assert t.rejected_counters.get("max_open_pairs", 0) == 1
 
@@ -233,8 +244,11 @@ def test_all_four_costs_charged():
     t, pf, bm = trader(max_hold_hours=0.05)
     open_pair(t)
     p = list(t.open_pairs.values())[0]
-    p.opened_at = time.time() - 3600.0          # таймаут истёк
-    closed = step(t, 100, 100.2, 101.0, 101.2) # базис стабилен, не сошёлся
+    # Таймаут принадлежит паре (Шаг 0.4) - отступаем на p.hold_hours
+    p.opened_at = time.time() - (p.hold_hours * 3600.0 + 60.0)
+    # Базис на выходе остаётся высоким (не сходится) - иначе сработает
+    # CONVERGED раньше, чем TIMEOUT, и тест проверял бы не то.
+    closed = step(t, 100, 100.2, 105.0, 105.2)
     assert len(closed) == 1
     assert closed[0].pnl < 0, "комиссии/перевод не учтены"
 
@@ -252,7 +266,7 @@ def test_transfer_fee_only_between_different_exchanges():
         volume=1e7, exchanges_count=2, timestamp=int(time.time()),
         max_safe_size_usdt=1000, confidence_score=80)
     asyncio.run(t2.execute(o, {"bybit": tk(100, 100.2)},
-                           futures_prices={SYM: {"bybit": tk(102, 102.2)}}))
+                           futures_prices={SYM: {"bybit": tk(FUT_BID, FUT_ASK)}}))
     assert len(t2.open_pairs) == 1, "одна биржа: пара не открылась"
     assert list(t2.open_pairs.values())[0].transfer_fee == 0
 
@@ -309,8 +323,8 @@ def test_repeated_cycles_do_not_leak_margin():
     for i in range(10):
         o = opp(sym=f"A{i}/USDT")
         asyncio.run(t.execute(
-            o, {"binance": tk(100, 100.2), "bybit": tk(102, 102.2)},
-            futures_prices={f"A{i}/USDT": {"bybit": tk(102, 102.2)}}))
+            o, {"binance": tk(100, 100.2), "bybit": tk(FUT_BID, FUT_ASK)},
+            futures_prices={f"A{i}/USDT": {"bybit": tk(FUT_BID, FUT_ASK)}}))
         sym = f"A{i}/USDT"
         t.manage_open_positions(
             {sym: {"binance": tk(100, 100.2), "bybit": tk(100, 100.2)}},
@@ -339,7 +353,7 @@ def test_execute_and_manage_use_different_dict_shapes():
     t, pf, bm = trader(target_close_pct=0.15)
     sym = "SOL/USDT"
     spot = tk(100, 100.2)
-    fut = tk(102, 102.2)
+    fut = tk(FUT_BID, FUT_ASK)
     # формат execute: спот по бирже
     asyncio.run(t.execute(
         opp(), {"binance": spot, "bybit": spot},

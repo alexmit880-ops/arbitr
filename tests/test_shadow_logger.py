@@ -25,14 +25,14 @@ def make_prices():
     исключительно фьючерсом (make_futures), а не спот-vs-спот."""
     now = int(time.time() * 1000)
     return {
-        "binance": Ticker("binance", "SOL/USDT", bid=99, ask=100, last=100,
+        "binance": Ticker("binance", "SOL/USDT", bid=99.9, ask=100.0, last=99.95,
                           volume=1_000_000, timestamp=now),
-        "bybit": Ticker("bybit", "SOL/USDT", bid=99, ask=100, last=100,
+        "bybit": Ticker("bybit", "SOL/USDT", bid=99.9, ask=100.0, last=99.95,
                         volume=1_000_000, timestamp=now),
     }
 
 
-def make_futures(symbol="SOL/USDT", bid=105, ask=106, ex="bybit"):
+def make_futures(symbol="SOL/USDT", bid=105.0, ask=105.2, ex="bybit"):
     now = int(time.time() * 1000)
     return {symbol: {ex: Ticker(ex, symbol, bid=bid, ask=ask, last=bid,
                                 volume=1_000_000, timestamp=now)}}
@@ -60,11 +60,11 @@ class TestShadowLogger:
         args.update(kw)
         return SpotFuturesPaperTrader(pf, bm, **args)
 
-    def _close(self, trader, fut=(99.4995, 99.6995)):
+    def _close(self, trader, fut=(99.9, 100.1)):
         """Прогоняет один цикл управления с заданными ценами фьючерса."""
         now = int(time.time() * 1000)
         spot_map = {"SOL/USDT": {
-            ex: Ticker(ex, "SOL/USDT", bid=99, ask=100, last=99.5,
+            ex: Ticker(ex, "SOL/USDT", bid=99.9, ask=100.0, last=99.95,
                        volume=1_000_000, timestamp=now)
             for ex in ("binance", "bybit")}}
         return trader.manage_open_positions(spot_map, make_futures(

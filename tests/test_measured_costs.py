@@ -32,9 +32,17 @@ def _tk(bid, ask):
                   int(time.time() * 1000))
 
 
-def _run_round_trip(size, spot_half_spread_pct=0.10, fut_half_spread_pct=0.10):
-    """Round-trip без движения цен. Возвращает (size, total_cost_pct, parts)."""
-    mid_s, mid_f = 100.0, 102.0
+def _run_round_trip(size, spot_half_spread_pct=0.10, fut_half_spread_pct=0.10,
+                    mid_f=105.0):
+    """
+    Round-trip без движения цен. Возвращает (size, total_cost_pct, parts).
+
+    mid_f по умолчанию 105, а не 102: базис 1.37% при размере 100 не
+    проходит финансовый критерий входа (BasisEntryCriteria требует
+    >= MIN_BASIS_PCT = 2.0%), и пара не открылась бы. Здесь измеряются
+    РАСХОДЫ, а не порог, а расход от размера спреда не зависит.
+    """
+    mid_s = 100.0
     sb = mid_s * (1 - spot_half_spread_pct / 100)
     sa = mid_s * (1 + spot_half_spread_pct / 100)
     fb = mid_f * (1 - fut_half_spread_pct / 100)

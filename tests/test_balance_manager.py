@@ -35,8 +35,8 @@ def make_prices():
     фантомный спред без фьючерсной ноги."""
     now = int(time.time() * 1000)
     return {
-        "binance": Ticker("binance", "SOL/USDT", bid=99, ask=100, last=100, volume=1_000_000, timestamp=now),
-        "bybit": Ticker("bybit", "SOL/USDT", bid=99, ask=100, last=100, volume=1_000_000, timestamp=now),
+        "binance": Ticker("binance", "SOL/USDT", bid=99.9, ask=100.0, last=99.95, volume=1_000_000, timestamp=now),
+        "bybit": Ticker("bybit", "SOL/USDT", bid=99.9, ask=100.0, last=99.95, volume=1_000_000, timestamp=now),
     }
 
 
@@ -51,14 +51,14 @@ def make_spot_spread_prices():
     """
     now = int(time.time() * 1000)
     return {
-        "binance": Ticker("binance", "SOL/USDT", bid=99, ask=100, last=100,
+        "binance": Ticker("binance", "SOL/USDT", bid=99.9, ask=100.0, last=99.95,
                           volume=1_000_000, timestamp=now),
-        "bybit": Ticker("bybit", "SOL/USDT", bid=105, ask=106, last=105,
+        "bybit": Ticker("bybit", "SOL/USDT", bid=105.0, ask=105.2, last=105.1,
                         volume=1_000_000, timestamp=now),
     }
 
 
-def make_futures(symbol="SOL/USDT", bid=105, ask=106, ex="bybit"):
+def make_futures(symbol="SOL/USDT", bid=105.0, ask=105.2, ex="bybit"):
     """Фьючерс/перп: по СИМВОЛУ внутри лежит биржа (в отличие от спота)."""
     now = int(time.time() * 1000)
     return {symbol: {ex: Ticker(ex, symbol, bid=bid, ask=ask, last=bid, volume=1_000_000, timestamp=now)}}
@@ -177,13 +177,13 @@ class TestSpotFuturesPaperTrader:
     передаётся явно через make_futures().
     """
 
-    def _open(self, trader, opp=None, spot=(99, 100), fut=(105, 106)):
+    def _open(self, trader, opp=None, spot=(99.9, 100.0), fut=(105.0, 105.2)):
         """Открыть пару: спот на binance, шорт фьючерса на bybit."""
         return asyncio.run(trader.execute(
             opp or make_opp(), make_prices(),
             futures_prices=make_futures(bid=fut[0], ask=fut[1])))
 
-    def _manage(self, trader, spot=(99, 100), fut=(105, 106)):
+    def _manage(self, trader, spot=(99.9, 100.0), fut=(105.0, 105.2)):
         """
         Структуры для manage_open_positions() отличаются от execute():
         здесь оба словаря ключуются СИМВОЛОМ, а не биржей.
@@ -247,7 +247,7 @@ class TestSpotFuturesPaperTrader:
         )
         self._open(trader)
         # фьючерс падает к споту: basis был +5%, станет ~+0.1% — сходимость
-        closed = self._manage(trader, fut=(99.4995, 99.6995))
+        closed = self._manage(trader, fut=(99.9, 100.1))
 
         assert len(closed) == 1
         assert not trader.open_pairs
@@ -272,7 +272,7 @@ class TestSpotFuturesPaperTrader:
             self._open(t)
             p = next(iter(t.open_pairs.values()))
             p.opened_at = time.time() - hours * 3600.0
-            c = self._manage(t, fut=(99.4995, 99.6995))
+            c = self._manage(t, fut=(99.9, 100.1))
             assert len(c) == 1
             return c[0].pnl
 

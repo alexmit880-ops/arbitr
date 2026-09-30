@@ -111,6 +111,53 @@ PARTIAL_FILL_MAX_RATIO = float(os.getenv("PARTIAL_FILL_MAX_RATIO", "1.0"))
 
 FUTURES_LEVERAGE = float(os.getenv("FUTURES_LEVERAGE", "1"))
 PAPER_HOLD_HOURS = float(os.getenv("PAPER_HOLD_HOURS", "0"))
+
+# ── Экономика удержания (Шаг 0.4, 2026-09-30) ─────────────────────────
+#
+# Расходы round-trip ИЗМЕРЕНЫ эмпирически (см. tests/test_measured_costs.py):
+# открытие пары и закрытие без изменения цен даёт PnL = -расходы.
+#
+#   size=100  USDT -> 1.650%
+#   size=1000 USDT -> 2.011%
+#
+# Декомпозиция при size=100:
+#   комиссии 2 ноги        0.20%
+#   перевод                0.20%
+#   скольжение 4 ноги      0.84%
+#   пересечение спреда     0.40%   <- 24% всех расходов
+#
+# Отсюда порог входа: минимум 2.0% базиса.
+PAPER_HOLD_HOURS_MIN = float(os.getenv("PAPER_HOLD_HOURS_MIN", "0.5"))
+PAPER_HOLD_HOURS_MAX = float(os.getenv("PAPER_HOLD_HOURS_MAX", "4.0"))
+
+# Таблица "базис -> время удержания".
+# Базис ниже порога входа не торгуется, поэтому таблица начинается с 2.0:
+# короткий базис либо сходится быстро, либо его не существует.
+BASIS_TO_HOLD_HOURS = [
+    (2.0, 0.5),
+    (2.5, 1.0),
+    (3.0, 1.5),
+    (4.0, 2.5),
+    (6.0, 3.5),
+    (999.0, 4.0),   # потолок
+]
+
+# Минимальный базис для входа, %  (измерения: p99 базиса = 3.44%,
+# выше 2.0% — лишь 5 пар из 507)
+MIN_BASIS_PCT = float(os.getenv("MIN_BASIS_PCT", "2.0"))
+# Маржа безопасности над точкой безубытка
+BASIS_SAFETY_MARGIN_PCT = float(os.getenv("BASIS_SAFETY_MARGIN_PCT", "0.10"))
+# Почасовой расход на удержание (деградация базиса), %
+BASIS_HOURLY_DEGRADATION_PCT = float(os.getenv(
+    "BASIS_HOURLY_DEGRADATION_PCT", "0.02"))
+# Жёсткое отсечение по спреду: актив с бо́льшим спредом не торгуется
+# ни при каком базисе (расход растёт 1:1 со спредом на ногу).
+MAX_TRADABLE_SPREAD_PCT = float(os.getenv("MAX_TRADABLE_SPREAD_PCT", "0.5"))
+# Калибровочный сдвиг в формуле расходов BasisEntryCriteria.
+# Введён по результатам измерений: базовая формула (комиссии + перевод +
+# скольжение) без спреда даёт 1.440%, а измеренный round-trip при нулевом
+# спреде — 1.248%. Разница 0.192% ~= типичный спред USDT-пары (0.2%).
+SPREAD_REFERENCE_PCT = float(os.getenv("SPREAD_REFERENCE_PCT", "0.20"))
 FUTURES_FUNDING_RATE_PER_HOUR = float(os.getenv("FUTURES_FUNDING_RATE_PER_HOUR", "0"))
 KELLY_FRACTION = 0.25
 KELLY_FRACTION_EARLY = 0.10
