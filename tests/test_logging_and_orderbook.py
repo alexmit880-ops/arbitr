@@ -540,3 +540,60 @@ def test_gitattributes_forces_lf():
     text = open(path, encoding="utf-8").read()
     assert "*.sh text eol=lf" in text, "нет правила для .sh"
     assert "*.service text eol=lf" in text, "нет правила для .service"
+
+
+# ──────── изоляция systemd не должна ломать запуск (Шаг 1.8) ────────
+
+def _service_executable_lines():
+    """Исполняемые строки юнита (без комментариев)."""
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "deploy", "arb-bot.service"),
+                encoding="utf-8").read()
+    return "\n".join(ln for ln in text.splitlines()
+                      if ln.strip() and not ln.strip().startswith("#"))
+
+
+def test_no_protect_home_readonly():
+    """ProtectHome=read-only ломает запуск, потому что сервис идёт от root.
+
+    Шаг 1.8: на Hive OS %h = /root, а ProtectHome делает /root доступным
+    только для чтения. Бот при старте пишет на диск ДО включения лога:
+        config.py:7  Path("logs").mkdir(exist_ok=True)
+    и mkdir падал с PermissionError. Сообщение уходило только в stderr
+    systemd, потому что hunter.log к тому моменту ещё не был настроен, -
+    отсюда "тишина" в логе при status=1/FAILURE.
+
+    ReadWritePaths не помогает: по документации systemd ProtectHome
+    применяется ПОСЛЕ ReadWritePaths и закрывает домашний каталог целиком.
+    """
+    code = _service_executable_lines()
+    assert "ProtectHome=read-only" not in code, (
+        "ProtectHome=read-only запретит запись в ~/arbitr, и бот упадёт "
+        "на mkdir logs/ до того, как лог вообще настроится")
+    assert "ProtectHome=true" not in code, "ProtectHome=true тоже закрывает"
+    # ReadWritePaths должен остаться - системные каталоги всё ещё полезно
+    # закрыть, а рабочий каталог открыть.
+    assert "ReadWritePaths=" in code, "нужен ReadWritePaths вместо ProtectHome"
+    assert "ProtectSystem=full" in code, "системные каталоги стоит закрыть"
+
+
+def test_config_creates_logs_before_logging_starts():
+    """config.py пишет на диск при ИМПОРТЕ - это ловушка для диагностики.
+
+    mkdir происходит до setup_file_logging(), поэтому любая ошибка записи
+    не попадает в hunter.log. Тест фиксирует сам факт, чтобы при
+    следующем рефакторинге не переставить порядок случайно.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cfg = open(os.path.join(root, "config.py"), encoding="utf-8").read()
+    app_src = open(os.path.join(root, "app.py"), encoding="utf-8").read()
+    assert 'Path("logs").mkdir' in cfg, "config.py больше не создаёт logs/"
+    i_import = app_src.index("from config import *")
+    i_log = app_src.index("setup_file_logging()")
+    assert i_import < i_log, (
+        "config импортируется раньше настройки лога - значит ошибки "
+        "записи в logs/ не попадут в hunter.log и будут видны только "
+        "в stderr. Это ровно тот случай, из-за которого падение на риге "
+        "выглядело как тишина.")
