@@ -714,7 +714,10 @@ def test_script_runs_without_home_env(tmp_path):
     # получался вида "cUsers..." без разделителей.
     posix = re.sub(r"[\\:]+", "/", str(scripts / "run_bot.sh"))
     posix = "/" + posix[0].lower() + posix[1:]
-    r = subprocess.run([bash, "-c", f"env -u HOME bash {posix}"],
+    # cd в tmp-проект: иначе скрипт нашёл бы НАСТОЯЩИЙ репозиторий
+    # проверял бы не то, а свой проект в tmp.
+    r = subprocess.run([bash, "-c",
+                       f"cd {_to_posix(proj)} && env -u HOME bash {posix}"],
                        capture_output=True, text=True,
                        encoding="utf-8", errors="replace", timeout=60)
     out = r.stdout + r.stderr
@@ -722,3 +725,105 @@ def test_script_runs_without_home_env(tmp_path):
         f"скрипт падает без HOME: {out[:300]}")
     assert "Запуск бота" in out, (
         f"бот не стартовал без HOME: {out[:300]}")
+
+
+# ──────── скрипт ищет проект там, где его реально кладут (Шаг 1.10) ────────
+
+def _bash():
+    import os
+    for c in (r"C:\Program Files\Git\bin\bash.exe",
+              r"C:\Program Files (x86)\Git\bin\bash.exe",
+              "/bin/bash", "/usr/bin/bash"):
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _to_posix(path):
+    import re
+    p = re.sub(r"[\\:]+", "/", str(path))
+    return "/" + p[0].lower() + p[1:]
+
+
+def _make_proj(base, script_at="deploy/run_bot.sh"):
+    """Готовая структура проекта + копия скрипта."""
+    import os
+    import shutil
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    proj = base / "arbitr"
+    (proj / "venv" / "bin").mkdir(parents=True)
+    (proj / "logs").mkdir()
+    (proj / "app.py").write_text("", encoding="utf-8")
+    (proj / ".env").write_text("TRADING_MODE=paper\n", encoding="utf-8")
+    py = proj / "venv" / "bin" / "python"
+    py.write_text("#!/bin/bash\nexit 0\n", encoding="utf-8")
+    os.chmod(py, 0o755)
+    target = base / script_at
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(os.path.join(root, "deploy", "run_bot.sh"), str(target))
+    return proj, target
+
+
+def test_finds_project_when_script_inside_it(tmp_path):
+    """СЦЕНАРИЙ СЕРВИСА: скрипт в <проект>/deploy/, HOME не задан.
+
+    Шаг 1.10: ExecStart = %h/arbitr/deploy/run_bot.sh, то есть скрипт
+    лежит ВНУТРИ проекта. Прежний поиск смотрел только на $HOME/arbitr
+    (под systemd HOME не задан) и $script_dir/../arbitr (искал
+    arbitr/arbitr) - и оба раза промахивался, отсюда был exit 78.
+    """
+    import subprocess
+    bash = _bash()
+    if not bash:
+        pytest.skip("bash недоступен")
+    proj, script = _make_proj(tmp_path, "arbitr/deploy/run_bot.sh")
+    r = subprocess.run(
+        [bash, "-c",
+         f"cd {_to_posix(proj)} && env -u HOME bash {_to_posix(script)}"],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60)
+    out = r.stdout + r.stderr
+    assert "Запуск бота" in out, (
+        f"скрипт в deploy/ не нашёл проект: {out[:300]}")
+    assert "unbound variable" not in out, out[:300]
+
+
+def test_finds_project_when_script_in_separate_dir(tmp_path):
+    """СЦЕНАРИЙ ИНСТРУКЦИИ: скрипт в ~/scripts, проект в ~/arbitr."""
+    import subprocess
+    bash = _bash()
+    if not bash:
+        pytest.skip("bash недоступен")
+    proj, script = _make_proj(tmp_path, "scripts/run_bot.sh")
+    home = tmp_path
+    r = subprocess.run(
+        [bash, "-c",
+         f"cd {_to_posix(home)} && HOME={_to_posix(home)} "
+         f"bash {_to_posix(script)}"],
+        capture_output=True, text=True, encoding="utf-8",
+        errors="replace", timeout=60)
+    out = r.stdout + r.stderr
+    assert "Запуск бота" in out, f"не нашёл проект из ~/scripts: {out[:300]}"
+
+
+def test_failure_exit_codes_are_distinct():
+    """Разные причины отказа - разные коды выхода.
+
+    Шаг 1.10: на "не нашёл проект" и на "нет venv" был ОДИН код 78.
+    По строке "status=78" в systemctl невозможно было понять, что
+    сломалось, - пришлось гадать. Теперь у каждой причины свой код.
+    """
+    import os
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    text = open(os.path.join(root, "deploy", "run_bot.sh"),
+                encoding="utf-8").read()
+    _code = "\n".join(ln for ln in text.splitlines()
+                      if not ln.strip().startswith("#"))
+    # Схема кодов: 78 = не нашёл проект, 79 = нет venv / не сменил
+    # каталог, 80 = запрещён live-режим, 75 = уже работает другой
+    # экземпляр. Каждый отказ обязан иметь свой код.
+    for code, why in (("78", "не нашёл проект"), ("79", "нет venv"),
+                     ("80", "запрещён live"), ("75", "двойной запуск")):
+        assert f"exit {code}" in _code, f"нет кода {code} ({why})"
+    assert _code.count("exit 78") == 1, (
+        "код 78 должен быть ровно один раз - только 'не нашёл проект'")

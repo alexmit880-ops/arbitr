@@ -54,7 +54,20 @@ set -uo pipefail
 find_app_dir() {
     local cand script_dir home="${HOME:-}"
     script_dir="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
-    for cand in "${1:-}" "$home/arbitr" "$script_dir/../arbitr"; do
+    # Шаг 1.10: добавлены $PWD и $script_dir/..
+    #
+    # Сервис запускает /bin/bash %h/arbitr/deploy/run_bot.sh, то есть
+    # скрипт лежит ВНУТРИ проекта, в подкаталоге deploy/. Прежние
+    # кандидаты ($HOME/arbitr и $script_dir/../arbitr) рассчитаны на
+    # другое расположение - скрипт в ~/scripts, проект в ~/arbitr.
+    # Под systemd HOME не задан, поэтому первый кандидат не работает,
+    # а второй искал "arbitr/arbitr".
+    #
+    # $PWD - надёжнее всех: systemd выставляет WorkingDirectory,
+    # поэтому попадание точное.
+    # $script_dir/.. - каталог проекта, когда скрипт внутри него.
+    for cand in "${1:-}" "$PWD" "$home/arbitr" "$script_dir/.." \
+                "$script_dir/../arbitr"; do
         if [ -n "$cand" ] && [ -f "$cand/app.py" ]; then
             readlink -f "$cand"
             return 0
@@ -64,10 +77,14 @@ find_app_dir() {
 }
 
 APP_DIR="$(find_app_dir "${1:-}")" || {
+    # exit 78 = EX_CONFIG. Разводим коды отказов: раньше на "не нашёл
+    # проект", на "нет venv" и на "cd не удался" был ОДИН код 78, и
+    # по строке "status=78" в systemctl невозможно было понять, что
+    # именно сломалось. Теперь у каждой причины свой код.
     echo "FATAL: не нашёл каталог с app.py."
-    # "${1:-...}" и "${HOME:-...}" - обе переменные обязаны быть
-    # с защитой: под systemd HOME не задан вовсе.
-    echo "Проверил: '${1:-<аргумент не передан>}', '${HOME:-<HOME не задан>}/arbitr', <каталог скрипта>/../arbitr"
+    echo "Проверил: '${1:-<аргумент не передан>}', '${HOME:-<HOME не задан>}/arbitr', '$PWD', <каталог скрипта>/.."
+    echo "Подсказка: сервис запускает deploy/run_bot.sh, поэтому каталог"
+    echo "проекта лежит на один уровень выше скрипта."
     echo "Запустите с явным путём: $0 /путь/к/проекту"
     exit 78
 }
@@ -75,14 +92,15 @@ APP_DIR="$(find_app_dir "${1:-}")" || {
 LOG_DIR="${APP_DIR}/logs"
 PYTHON="${APP_DIR}/venv/bin/python"
 
-cd "$APP_DIR" || { echo "FATAL: не могу перейти в $APP_DIR"; exit 78; }
+cd "$APP_DIR" || { echo "FATAL: не могу перейти в $APP_DIR"; exit 79; }
 mkdir -p "$LOG_DIR"
 
 if [ ! -x "$PYTHON" ]; then
+    # exit 79 = отдельный код (раньше делил 78 с поиском каталога)
     echo "FATAL: нет интерпретатора $PYTHON"
     echo "Создайте venv: python3 -m venv ${APP_DIR}/venv"
     echo "И поставьте зависимости: ${PYTHON} -m pip install -r requirements.txt"
-    exit 78
+    exit 79
 fi
 
 # ─── Проверка режима торговли ───
@@ -91,9 +109,11 @@ TRADING_MODE="${TRADING_MODE:-paper}"
 if [ "$TRADING_MODE" != "paper" ]; then
     echo "FATAL: TRADING_MODE=$TRADING_MODE, а на ферме разрешён только paper."
     echo "Бот не запущен. Это защита от реальных ордеров без присмотра."
-    exit 78
+    # Код 80 - свой, чтобы по строке status= в systemctl отличать
+    # "запрещён live-режим" от "не нашёл проект" (78) и "нет venv" (79).
+    # Раньше все три делили 78, и по коду нельзя было понять причину.
+    exit 80
 fi
-
 echo "=== Запуск бота $(date '+%F %T') | режим=$TRADING_MODE | pid=$$ ==="
 
 # Защита от двух копий: две копии держат открытые пары в своей памяти и
