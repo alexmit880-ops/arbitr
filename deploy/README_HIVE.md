@@ -189,3 +189,79 @@ sudo systemctl stop arb-bot.service
   не стоит.
 - Не копируйте `hunter.db` с рабочей машины: там 2 осиротевшие пары с
   неполными данными, они засорят новый прогон.
+---
+
+## Шаг 1.11: сбор данных 24-часового прогона
+
+Прогон запущен (`Active: active (running)`). Через 24 часа нужно
+снять результаты. Одна команда собирает всё:
+
+```bash
+python3 - <<'EOF'
+import sqlite3, time, os
+c = sqlite3.connect('/root/arbitr/hunter.db')
+c.row_factory = sqlite3.Row
+now = int(time.time())
+since = now - 24*3600
+q = lambda s, *a: c.execute(s, a).fetchall()
+print("=== ПРОГОН за 24 часа ===")
+r = q("SELECT COUNT(*) n, COALESCE(SUM(pnl),0) pnl, COALESCE(AVG(pnl_pct),0) pct,"
+      " SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) wins FROM trades"
+      " WHERE status='closed' AND ts>=?", since)[0]
+print(f"сделок: {r['n']}  PnL: {r['pnl']:+.2f} USDT  средний: {r['pct']:+.3f}%")
+print(f"прибыльных: {r['wins']}  WR: {100*r['wins']/max(r['n'],1):.1f}%")
+print()
+print("=== по категориям (базис входа) ===")
+for row in q("SELECT category, COUNT(*) n, AVG(pnl_pct) a FROM trades"
+             " WHERE status='closed' AND ts>=? GROUP BY category"
+             " ORDER BY n DESC", since):
+    print(f"  {row['category']:<12} {row['n']:>4}  средний {row['a']:+.3f}%")
+print()
+print("=== открытые пары (hold_hours из Шага 1.0) ===")
+for row in q("SELECT symbol, buy_ex, sell_ex, size_usdt, hold_hours,"
+             " fut_reserved, entry_basis, ts FROM trades WHERE status='open'"):
+    age = (now - row['ts'])/3600
+    flag = "  <-- ПЕРЕЖИЛА ТАЙМАУТ" if age > (row['hold_hours'] or 4) else ""
+    print(f"  {row['symbol']} {row['buy_ex']}->{row['sell_ex']} "
+          f"${row['size_usdt']:.0f} возраст {age:.2f}ч "
+          f"таймаут {row['hold_hours']:.1f}ч "
+          f"резерв ${row['fut_reserved']:.2f} "
+          f"базис {row['entry_basis']:.2f}%{flag}")
+print()
+print("=== последние 10 закрытых ===")
+for row in q("SELECT symbol,buy_ex,sell_ex,pnl,pnl_pct,size_usdt,ts"
+             " FROM trades WHERE status='closed' AND ts>=? ORDER BY id DESC"
+             " LIMIT 10", since):
+    print(f"  {row['symbol']:<12} {row['buy_ex']}->{row['sell_ex']} "
+          f"${row['size_usdt']:.0f} PnL {row['pnl']:+.3f} ({row['pnl_pct']:+.2f}%)")
+print()
+print("=== ОШИБКИ в логе за сутки ===")
+c.close()
+os.system("grep -c ERROR /root/arbitr/logs/hunter.log || true")
+os.system("grep -c 'Бот упал' /root/arbitr/logs/hunter.log || true")
+print("=== память сервиса сейчас ===")
+os.system("systemctl show arb-bot -p MemoryCurrent --value")
+EOF
+```
+
+Что смотреть в первую очередь:
+
+1. **Сделок: 0** - значит бот не открывает пары. Тогда прогон бессмыслен,
+   надо смотреть почему (см. лог, ищи "blocked" и "max_trades").
+2. **hold_hours в открытых парах = 4.0 у всех** - значит новая колонка
+   не заполнилась, то есть пары пишутся старым путём.
+3. **"ПЕРЕЖИЛА ТАЙМАУТ"** - пары не закрываются вовремя, таймаут
+   не работает.
+4. **Ошибки > 0** - смотреть `grep ERROR logs/hunter.log`.
+
+## Если память всё же убьёт бота
+
+OOMPolicy=kill + Restart=means бот поднимется сам, но прогон
+прервётся. Проверить:
+
+```bash
+journalctl -u arb-bot | grep -i "killed\|oom\|memory"
+```
+
+Если OOM повторяется - снизить нагрузку в config.py:
+MAX_SYMBOLS = 400 (было 800). Меньше символов = меньше памяти.
